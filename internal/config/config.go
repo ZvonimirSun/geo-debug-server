@@ -7,11 +7,12 @@ import (
 )
 
 type Config struct {
-	Listen    string
-	BasePath  string
-	PublicURL string
-	Database  string
-	Version   bool
+	Listen         string
+	BasePath       string
+	PublicURL      string
+	Database       string
+	SchemeCacheTTL string
+	Version        bool
 }
 
 func Parse() Config {
@@ -20,6 +21,7 @@ func Parse() Config {
 	flag.StringVar(&cfg.BasePath, "base-path", envOr("GEO_DEBUG_BASE_PATH", "/geo-debug-server"), "HTTP base path")
 	flag.StringVar(&cfg.PublicURL, "public-url", envOr("GEO_DEBUG_PUBLIC_URL", ""), "public base URL used in metadata")
 	flag.StringVar(&cfg.Database, "database", envOr("GEO_DEBUG_DATABASE", "./data/geo-debug.db"), "SQLite database path")
+	flag.StringVar(&cfg.SchemeCacheTTL, "scheme-cache-ttl", envOr("GEO_DEBUG_SCHEME_CACHE_TTL", "5m"), "sliding TTL for the in-memory tile scheme cache; 0 disables it")
 	flag.BoolVar(&cfg.Version, "version", false, "print version information and exit")
 	flag.Parse()
 	cfg.BasePath = NormalizeBasePath(cfg.BasePath)

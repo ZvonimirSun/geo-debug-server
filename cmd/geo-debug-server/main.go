@@ -24,7 +24,11 @@ func main() {
 		return
 	}
 	ctx := context.Background()
-	database, err := store.Open(ctx, cfg.Database)
+	cacheTTL, err := time.ParseDuration(cfg.SchemeCacheTTL)
+	if err != nil || cacheTTL < 0 {
+		log.Fatalf("invalid scheme cache TTL %q: use a non-negative duration such as 5m or 0", cfg.SchemeCacheTTL)
+	}
+	database, err := store.OpenWithCacheTTL(ctx, cfg.Database, cacheTTL)
 	if err != nil {
 		log.Fatalf("initialize database: %v", err)
 	}

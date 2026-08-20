@@ -9,17 +9,22 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 const (
-	WebMercatorQuad = "WebMercatorQuad"
-	WorldCRS84Quad  = "WorldCRS84Quad"
+	WebMercatorQuad       = "WebMercatorQuad"
+	WorldCRS84Quad        = "WorldCRS84Quad"
+	DefaultSchemeCacheTTL = 5 * time.Minute
 )
 
-var ErrSchemeNotFound = errors.New("tile scheme not found")
+var (
+	ErrSchemeNotFound = errors.New("tile scheme not found")
+	ErrStoreClosed    = errors.New("tile scheme store is closed")
+)
 
 type Scheme struct {
 	ID         string
@@ -57,9 +62,27 @@ type Bounds struct {
 
 type Store struct {
 	db *sql.DB
+
+	cacheMu       sync.Mutex
+	cache         map[string]*schemeCacheEntry
+	cacheTTL      time.Duration
+	cacheSequence uint64
+	schemeLoads   uint64
+	closed        bool
+}
+
+type schemeCacheEntry struct {
+	scheme     Scheme
+	expiresAt  time.Time
+	generation uint64
+	timer      *time.Timer
 }
 
 func Open(ctx context.Context, databasePath string) (*Store, error) {
+	return OpenWithCacheTTL(ctx, databasePath, DefaultSchemeCacheTTL)
+}
+
+func OpenWithCacheTTL(ctx context.Context, databasePath string, cacheTTL time.Duration) (*Store, error) {
 	dsn, err := databaseDSN(databasePath)
 	if err != nil {
 		return nil, err
@@ -70,7 +93,7 @@ func Open(ctx context.Context, databasePath string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, cache: make(map[string]*schemeCacheEntry), cacheTTL: cacheTTL}
 	if err := s.init(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -96,7 +119,22 @@ func databaseDSN(databasePath string) (string, error) {
 	return "file:" + filepath.ToSlash(absPath) + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	s.cacheMu.Lock()
+	if s.closed {
+		s.cacheMu.Unlock()
+		return nil
+	}
+	s.closed = true
+	for key, entry := range s.cache {
+		if entry.timer != nil {
+			entry.timer.Stop()
+		}
+		delete(s.cache, key)
+	}
+	s.cacheMu.Unlock()
+	return s.db.Close()
+}
 
 func (s *Store) init(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -152,6 +190,25 @@ func seedScheme(ctx context.Context, tx *sql.Tx, scheme Scheme) error {
 }
 
 func (s *Store) Scheme(ctx context.Context, id string) (Scheme, error) {
+	key := schemeCacheKey(id)
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.closed {
+		return Scheme{}, ErrStoreClosed
+	}
+	if scheme, ok := s.cachedSchemeLocked(key); ok {
+		return cloneScheme(scheme), nil
+	}
+	scheme, err := s.loadScheme(ctx, id)
+	if err != nil {
+		return Scheme{}, err
+	}
+	s.schemeLoads++
+	s.cacheSchemeLocked(key, scheme)
+	return cloneScheme(scheme), nil
+}
+
+func (s *Store) loadScheme(ctx context.Context, id string) (Scheme, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, name, crs, tile_width, tile_height, min_zoom, max_zoom,
 		       origin_x, origin_y, min_x, min_y, max_x, max_y, is_default
@@ -176,6 +233,15 @@ func (s *Store) Scheme(ctx context.Context, id string) (Scheme, error) {
 }
 
 func (s *Store) DefaultScheme(ctx context.Context) (Scheme, error) {
+	const defaultCacheKey = "\x00default"
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.closed {
+		return Scheme{}, ErrStoreClosed
+	}
+	if scheme, ok := s.cachedSchemeLocked(defaultCacheKey); ok {
+		return cloneScheme(scheme), nil
+	}
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id FROM tile_schemes ORDER BY is_default DESC, id LIMIT 1`)
 	var id string
@@ -185,10 +251,27 @@ func (s *Store) DefaultScheme(ctx context.Context) (Scheme, error) {
 		}
 		return Scheme{}, fmt.Errorf("query default tile scheme: %w", err)
 	}
-	return s.Scheme(ctx, id)
+	key := schemeCacheKey(id)
+	scheme, ok := s.cachedSchemeLocked(key)
+	if !ok {
+		loaded, err := s.loadScheme(ctx, id)
+		if err != nil {
+			return Scheme{}, err
+		}
+		scheme = loaded
+		s.schemeLoads++
+		s.cacheSchemeLocked(key, scheme)
+	}
+	s.cacheSchemeLocked(defaultCacheKey, scheme)
+	return cloneScheme(scheme), nil
 }
 
 func (s *Store) Schemes(ctx context.Context) ([]Scheme, error) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM tile_schemes ORDER BY is_default DESC, id`)
 	if err != nil {
 		return nil, fmt.Errorf("query tile schemes: %w", err)
@@ -207,11 +290,17 @@ func (s *Store) Schemes(ctx context.Context) ([]Scheme, error) {
 	}
 	result := make([]Scheme, 0, len(ids))
 	for _, id := range ids {
-		scheme, err := s.Scheme(ctx, id)
-		if err != nil {
-			return nil, err
+		key := schemeCacheKey(id)
+		scheme, ok := s.cachedSchemeLocked(key)
+		if !ok {
+			scheme, err = s.loadScheme(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			s.schemeLoads++
+			s.cacheSchemeLocked(key, scheme)
 		}
-		result = append(result, scheme)
+		result = append(result, cloneScheme(scheme))
 	}
 	return result, nil
 }
@@ -237,6 +326,73 @@ func (s *Store) levels(ctx context.Context, schemeID string) ([]MatrixLevel, err
 		return nil, fmt.Errorf("iterate tile matrix levels: %w", err)
 	}
 	return levels, nil
+}
+
+func schemeCacheKey(id string) string {
+	return strings.ToLower(id)
+}
+
+func (s *Store) cachedSchemeLocked(key string) (Scheme, bool) {
+	if s.cacheTTL <= 0 {
+		return Scheme{}, false
+	}
+	entry, ok := s.cache[key]
+	if !ok {
+		return Scheme{}, false
+	}
+	now := time.Now()
+	if !now.Before(entry.expiresAt) {
+		if entry.timer != nil {
+			entry.timer.Stop()
+		}
+		delete(s.cache, key)
+		return Scheme{}, false
+	}
+	s.scheduleExpiryLocked(key, entry, now)
+	return entry.scheme, true
+}
+
+func (s *Store) cacheSchemeLocked(key string, scheme Scheme) {
+	if s.cacheTTL <= 0 || s.closed {
+		return
+	}
+	if existing := s.cache[key]; existing != nil && existing.timer != nil {
+		existing.timer.Stop()
+	}
+	entry := &schemeCacheEntry{scheme: cloneScheme(scheme)}
+	s.cache[key] = entry
+	s.scheduleExpiryLocked(key, entry, time.Now())
+}
+
+func (s *Store) scheduleExpiryLocked(key string, entry *schemeCacheEntry, now time.Time) {
+	if entry.timer != nil {
+		entry.timer.Stop()
+	}
+	s.cacheSequence++
+	entry.generation = s.cacheSequence
+	entry.expiresAt = now.Add(s.cacheTTL)
+	generation := entry.generation
+	entry.timer = time.AfterFunc(s.cacheTTL, func() {
+		s.expireScheme(key, generation)
+	})
+}
+
+func (s *Store) expireScheme(key string, generation uint64) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.closed {
+		return
+	}
+	entry := s.cache[key]
+	if entry == nil || entry.generation != generation || time.Now().Before(entry.expiresAt) {
+		return
+	}
+	delete(s.cache, key)
+}
+
+func cloneScheme(scheme Scheme) Scheme {
+	scheme.Levels = append([]MatrixLevel(nil), scheme.Levels...)
+	return scheme
 }
 
 func (s Scheme) Level(identifier string) (MatrixLevel, bool) {

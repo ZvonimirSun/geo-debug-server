@@ -18,9 +18,10 @@ Usage:
   -base-path string    服务基础路径，默认 /geo-debug-server
   -public-url string   元数据中使用的公开基础 URL
   -database string     SQLite 文件路径，默认 ./data/geo-debug.db
+  -scheme-cache-ttl duration  切片方案内存缓存的滑动 TTL，默认 5m，设置 0 可禁用
 ```
 
-对应环境变量为 `GEO_DEBUG_LISTEN`、`GEO_DEBUG_BASE_PATH`、`GEO_DEBUG_PUBLIC_URL` 和 `GEO_DEBUG_DATABASE`。命令行参数优先于环境变量。
+对应环境变量为 `GEO_DEBUG_LISTEN`、`GEO_DEBUG_BASE_PATH`、`GEO_DEBUG_PUBLIC_URL`、`GEO_DEBUG_DATABASE` 和 `GEO_DEBUG_SCHEME_CACHE_TTL`。命令行参数优先于环境变量。
 
 查看当前二进制的版本、Git commit、构建时间、Go 版本和目标平台：
 
@@ -63,6 +64,13 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 | `WorldCRS84Quad` | `CRS:84` | 2x1 | 0-22 | 256x256 |
 
 切片方案保存在 `tile_schemes`，每一级参数保存在 `tile_matrix_levels`。首版不提供管理 API，可以直接查看 SQLite 数据确认方案参数。
+
+服务会在进程内缓存查询成功的切片方案及层级信息，默认滑动 TTL 为 5 分钟。每次命中都会重新续期；超过 TTL 未访问的方案会自动从内存释放，下次请求重新读取 SQLite。并发缓存 miss 只会执行一次 SQLite 加载。直接修改数据库后，变更最迟在对应缓存停止访问并过期后可见。
+
+```sh
+geo-debug-server --scheme-cache-ttl 30s
+geo-debug-server --scheme-cache-ttl 0
+```
 
 ## XYZ
 
@@ -137,10 +145,29 @@ http://localhost:8080/geo-debug-server/wms?REQUEST=GetMap&LAYERS=debug&CRS=EPSG:
 查询参数名不区分大小写。标准参数之外的参数会按名称排序后显示在图片中，`time` 仅在显式传入时显示：
 
 ```text
-http://localhost:8080/geo-debug-server/xyz/3/4/2.png?time=step-1&source=leaflet
+http://localhost:8080/geo-debug-server/xyz/3/4/2.png?time=step-1&source=test
 ```
 
-文字会先按像素宽度换行；内容超出高度时自动缩小字号并重新排版，不按高度省略正常请求内容。所有响应允许跨域访问，并支持 `GET`、`HEAD` 和 `OPTIONS`。
+文字会先按像素宽度换行；内容超出高度时自动缩小字号并重新排版，不按高度省略正常请求内容。所有响应允许任意来源跨域访问、任意请求头和任意响应头，并支持 `GET`、`HEAD` 和 `OPTIONS`。预检响应缓存 24 小时，不启用跨域凭据模式。
+
+## 缓存行为
+
+成功生成的 XYZ、WMTS 和 WMS PNG 默认返回长期不可变缓存：
+
+```text
+Cache-Control: public, max-age=31536000, immutable
+```
+
+同一路径和查询参数对应的图片内容保持不变。需要绕过缓存时，请求中可以设置以下任一请求头：
+
+```text
+Cache-Control: no-cache
+Cache-Control: no-store
+Cache-Control: max-age=0
+Pragma: no-cache
+```
+
+此时响应返回 `Cache-Control: no-store`。元数据和错误响应始终使用 `no-store`，不会长期缓存。
 
 ## Docker 部署
 

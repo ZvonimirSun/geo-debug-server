@@ -18,6 +18,11 @@ import (
 
 const maxWMSPixels = 4096 * 4096
 
+const (
+	immutableImageCache = "public, max-age=31536000, immutable"
+	noStoreCache        = "no-store"
+)
+
 type Server struct {
 	store     *store.Store
 	basePath  string
@@ -275,6 +280,7 @@ func (s *Server) writePNG(w http.ResponseWriter, r *http.Request, spec debugrend
 		s.writeError(w, r, http.StatusInternalServerError, "NoApplicableCode", err.Error())
 		return
 	}
+	w.Header().Set("Cache-Control", imageCacheControl(r))
 	writeResponse(w, r, http.StatusOK, "image/png", data)
 }
 
@@ -300,7 +306,9 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, 
 func writeResponse(w http.ResponseWriter, r *http.Request, status int, contentType string, data []byte) {
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	w.Header().Set("Cache-Control", "no-cache")
+	if w.Header().Get("Cache-Control") == "" {
+		w.Header().Set("Cache-Control", noStoreCache)
+	}
 	w.WriteHeader(status)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(data)
@@ -310,7 +318,24 @@ func writeResponse(w http.ResponseWriter, r *http.Request, status int, contentTy
 func setCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
+	w.Header().Set("Access-Control-Expose-Headers", "*")
+	w.Header().Set("Access-Control-Max-Age", "86400")
+}
+
+func imageCacheControl(r *http.Request) string {
+	for _, directive := range strings.Split(strings.ToLower(r.Header.Get("Cache-Control")), ",") {
+		directive = strings.ReplaceAll(strings.TrimSpace(directive), " ", "")
+		if directive == "no-cache" || directive == "no-store" || directive == "max-age=0" {
+			return noStoreCache
+		}
+	}
+	for _, directive := range strings.Split(strings.ToLower(r.Header.Get("Pragma")), ",") {
+		if strings.TrimSpace(directive) == "no-cache" {
+			return noStoreCache
+		}
+	}
+	return immutableImageCache
 }
 
 func splitPath(path string) []string {

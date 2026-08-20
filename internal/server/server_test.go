@@ -41,6 +41,12 @@ func TestXYZForLeaflet(t *testing.T) {
 	if response.Header().Get("Access-Control-Allow-Origin") != "*" {
 		t.Fatal("missing permissive CORS header")
 	}
+	if response.Header().Get("Access-Control-Allow-Headers") != "*" {
+		t.Fatal("CORS does not allow arbitrary request headers")
+	}
+	if response.Header().Get("Access-Control-Expose-Headers") != "*" {
+		t.Fatal("CORS does not expose arbitrary response headers")
+	}
 
 	crs84 := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/WorldCRS84Quad/0/1/0.png")
 	assertPNG(t, crs84, 256, 256)
@@ -127,6 +133,45 @@ func TestHeadAndOptions(t *testing.T) {
 	options := perform(t, handler, http.MethodOptions, "/geo-debug-server/wmts")
 	if options.Code != http.StatusNoContent {
 		t.Fatalf("unexpected OPTIONS status: %d", options.Code)
+	}
+	if options.Header().Get("Access-Control-Allow-Origin") != "*" ||
+		options.Header().Get("Access-Control-Allow-Headers") != "*" ||
+		options.Header().Get("Access-Control-Max-Age") != "86400" {
+		t.Fatalf("unexpected permissive CORS headers: %v", options.Header())
+	}
+}
+
+func TestImageCacheControl(t *testing.T) {
+	handler := testHandler(t)
+	target := "/geo-debug-server/xyz/0/0/0.png"
+
+	defaultResponse := perform(t, handler, http.MethodGet, target)
+	if actual := defaultResponse.Header().Get("Cache-Control"); actual != immutableImageCache {
+		t.Fatalf("unexpected default image cache control: %q", actual)
+	}
+
+	for name, headers := range map[string]map[string]string{
+		"no-cache":  {"Cache-Control": "no-cache"},
+		"no-store":  {"Cache-Control": "no-store"},
+		"max-age=0": {"Cache-Control": "public, max-age=0"},
+		"pragma":    {"Pragma": "no-cache"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, target, nil)
+			for key, value := range headers {
+				request.Header.Set(key, value)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if actual := response.Header().Get("Cache-Control"); actual != noStoreCache {
+				t.Fatalf("unexpected bypass cache control: %q", actual)
+			}
+		})
+	}
+
+	metadata := perform(t, handler, http.MethodGet, "/geo-debug-server/wmts")
+	if actual := metadata.Header().Get("Cache-Control"); actual != noStoreCache {
+		t.Fatalf("metadata must not be cached: %q", actual)
 	}
 }
 

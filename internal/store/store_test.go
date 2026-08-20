@@ -5,7 +5,10 @@ import (
 	"errors"
 	"math"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestDefaultSchemesAndBounds(t *testing.T) {
@@ -126,4 +129,192 @@ func TestUnknownScheme(t *testing.T) {
 	if !errors.Is(err, ErrSchemeNotFound) {
 		t.Fatalf("expected ErrSchemeNotFound, got %v", err)
 	}
+}
+
+func TestSchemeCacheUsesSlidingExpiration(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenWithCacheTTL(ctx, filepath.Join(t.TempDir(), "cache.db"), 100*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	first, err := database.Scheme(ctx, WebMercatorQuad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Levels[0].Resolution = -1
+	if _, err := database.db.ExecContext(ctx, `UPDATE tile_schemes SET name = 'Database Name' WHERE id = ?`, WebMercatorQuad); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	second, err := database.Scheme(ctx, WebMercatorQuad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Name == "Database Name" {
+		t.Fatal("scheme was reloaded before its sliding TTL expired")
+	}
+	if second.Levels[0].Resolution <= 0 {
+		t.Fatal("cached scheme shared its Levels slice with the caller")
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	third, err := database.Scheme(ctx, strings.ToLower(WebMercatorQuad))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Name == "Database Name" {
+		t.Fatal("case-insensitive cache hit did not extend the TTL")
+	}
+
+	waitFor(t, time.Second, func() bool {
+		database.cacheMu.Lock()
+		defer database.cacheMu.Unlock()
+		return len(database.cache) == 0
+	})
+	reloaded, err := database.Scheme(ctx, WebMercatorQuad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Name != "Database Name" {
+		t.Fatalf("expired scheme was not reloaded from SQLite: %q", reloaded.Name)
+	}
+	database.cacheMu.Lock()
+	loads := database.schemeLoads
+	database.cacheMu.Unlock()
+	if loads != 2 {
+		t.Fatalf("expected two SQLite scheme loads, got %d", loads)
+	}
+}
+
+func TestConcurrentSchemeCacheMissLoadsOnce(t *testing.T) {
+	database, err := OpenWithCacheTTL(context.Background(), filepath.Join(t.TempDir(), "concurrent.db"), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	const workers = 64
+	start := make(chan struct{})
+	errorsChannel := make(chan error, workers)
+	var group sync.WaitGroup
+	group.Add(workers)
+	for range workers {
+		go func() {
+			defer group.Done()
+			<-start
+			scheme, err := database.Scheme(context.Background(), WebMercatorQuad)
+			if err == nil && len(scheme.Levels) != 23 {
+				err = errors.New("scheme has incomplete matrix levels")
+			}
+			errorsChannel <- err
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(errorsChannel)
+	for err := range errorsChannel {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	database.cacheMu.Lock()
+	loads := database.schemeLoads
+	database.cacheMu.Unlock()
+	if loads != 1 {
+		t.Fatalf("concurrent cache miss loaded SQLite %d times", loads)
+	}
+}
+
+func TestDefaultSchemeCacheExpiresAndReloadsSelection(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenWithCacheTTL(ctx, filepath.Join(t.TempDir(), "default-cache.db"), 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	initial, err := database.DefaultScheme(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.ID != WebMercatorQuad {
+		t.Fatalf("unexpected initial default: %s", initial.ID)
+	}
+	if _, err := database.db.ExecContext(ctx, `
+		UPDATE tile_schemes SET is_default = CASE WHEN id = ? THEN 1 ELSE 0 END`, WorldCRS84Quad); err != nil {
+		t.Fatal(err)
+	}
+	cached, err := database.DefaultScheme(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.ID != WebMercatorQuad {
+		t.Fatalf("default selection changed before cache expiration: %s", cached.ID)
+	}
+
+	time.Sleep(80 * time.Millisecond)
+	reloaded, err := database.DefaultScheme(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.ID != WorldCRS84Quad {
+		t.Fatalf("default selection was not reloaded after expiration: %s", reloaded.ID)
+	}
+}
+
+func TestStoreCloseClearsSchemeCache(t *testing.T) {
+	database, err := OpenWithCacheTTL(context.Background(), filepath.Join(t.TempDir(), "close.db"), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Scheme(context.Background(), WebMercatorQuad); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("repeated close must be safe: %v", err)
+	}
+	database.cacheMu.Lock()
+	cacheSize := len(database.cache)
+	database.cacheMu.Unlock()
+	if cacheSize != 0 {
+		t.Fatalf("cache was not cleared on close: %d entries", cacheSize)
+	}
+	if _, err := database.Scheme(context.Background(), WebMercatorQuad); !errors.Is(err, ErrStoreClosed) {
+		t.Fatalf("expected ErrStoreClosed after close, got %v", err)
+	}
+	if _, err := database.Schemes(context.Background()); !errors.Is(err, ErrStoreClosed) {
+		t.Fatalf("expected ErrStoreClosed from Schemes after close, got %v", err)
+	}
+}
+
+func TestSchemeCacheKeyMatchesSQLiteLookupSemantics(t *testing.T) {
+	database, err := OpenWithCacheTTL(context.Background(), filepath.Join(t.TempDir(), "cache-key.db"), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := database.Scheme(context.Background(), WebMercatorQuad); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Scheme(context.Background(), " "+WebMercatorQuad+" "); !errors.Is(err, ErrSchemeNotFound) {
+		t.Fatalf("whitespace-padded ID must not hit the cache: %v", err)
+	}
+}
+
+func waitFor(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition was not met before timeout")
 }
