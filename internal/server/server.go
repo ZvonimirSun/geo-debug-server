@@ -1,0 +1,393 @@
+package server
+
+import (
+	"context"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/iszy/geo-debug-server/internal/config"
+	debugrender "github.com/iszy/geo-debug-server/internal/render"
+	"github.com/iszy/geo-debug-server/internal/store"
+)
+
+const maxWMSPixels = 4096 * 4096
+
+type Server struct {
+	store     *store.Store
+	basePath  string
+	publicURL string
+}
+
+func New(s *store.Store, cfg config.Config) http.Handler {
+	return &Server{store: s, basePath: config.NormalizeBasePath(cfg.BasePath), publicURL: strings.TrimRight(cfg.PublicURL, "/")}
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD, OPTIONS")
+		s.writeError(w, r, http.StatusMethodNotAllowed, "OperationNotSupported", "only GET, HEAD and OPTIONS are supported")
+		return
+	}
+
+	relative, ok := s.relativePath(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	switch {
+	case relative == "/xyz" || strings.HasPrefix(relative, "/xyz/"):
+		s.handleXYZ(w, r, relative)
+	case relative == "/wmts" || strings.HasPrefix(relative, "/wmts/"):
+		s.handleWMTS(w, r, relative)
+	case relative == "/wms":
+		s.handleWMS(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *Server) relativePath(path string) (string, bool) {
+	if s.basePath == "" {
+		return path, true
+	}
+	if path == s.basePath {
+		return "/", true
+	}
+	if !strings.HasPrefix(path, s.basePath+"/") {
+		return "", false
+	}
+	return strings.TrimPrefix(path, s.basePath), true
+}
+
+func (s *Server) handleXYZ(w http.ResponseWriter, r *http.Request, relative string) {
+	parts := splitPath(relative)
+	var schemeID, zoomText, columnText, rowText string
+	switch len(parts) {
+	case 4:
+		zoomText, columnText, rowText = parts[1], parts[2], trimPNG(parts[3])
+	case 5:
+		schemeID, zoomText, columnText, rowText = parts[1], parts[2], parts[3], trimPNG(parts[4])
+	default:
+		s.writeError(w, r, http.StatusBadRequest, "InvalidPath", "expected /xyz/{z}/{x}/{y}.png or /xyz/{scheme}/{z}/{x}/{y}.png")
+		return
+	}
+	if rowText == "" {
+		s.writeError(w, r, http.StatusBadRequest, "InvalidFormat", "XYZ tile path must end in .png")
+		return
+	}
+	scheme, err := s.resolveScheme(r.Context(), schemeID)
+	if err != nil {
+		s.writeStoreError(w, r, err)
+		return
+	}
+	params := normalizedQuery(r.URL.Query())
+	s.serveTile(w, r, tileRequest{
+		Scheme: scheme, Layer: "debug", Style: "default",
+		Zoom: zoomText, Column: columnText, Row: rowText,
+		Time: first(params, "TIME", ""), Extras: extras(params, map[string]bool{"TIME": true}),
+	})
+}
+
+func (s *Server) handleWMTS(w http.ResponseWriter, r *http.Request, relative string) {
+	parts := splitPath(relative)
+	if len(parts) > 1 {
+		s.handleWMTSREST(w, r, parts)
+		return
+	}
+	params := normalizedQuery(r.URL.Query())
+	request := strings.ToUpper(first(params, "REQUEST", ""))
+	if r.URL.RawQuery == "" || request == "GETCAPABILITIES" {
+		s.writeWMTSMetadata(w, r)
+		return
+	}
+	if request == "" {
+		request = "GETTILE"
+	}
+	if request != "GETTILE" {
+		s.writeError(w, r, http.StatusBadRequest, "OperationNotSupported", "supported WMTS requests are GetTile and GetCapabilities")
+		return
+	}
+
+	schemeID := first(params, "TILEMATRIXSET", store.WebMercatorQuad)
+	scheme, err := s.resolveScheme(r.Context(), schemeID)
+	if err != nil {
+		s.writeStoreError(w, r, err)
+		return
+	}
+	zoom, zoomOK := required(params, "TILEMATRIX")
+	row, rowOK := required(params, "TILEROW")
+	column, columnOK := required(params, "TILECOL")
+	if !zoomOK || !rowOK || !columnOK {
+		s.writeError(w, r, http.StatusBadRequest, "MissingParameterValue", "TILEMATRIX, TILEROW and TILECOL are required")
+		return
+	}
+	s.serveTile(w, r, tileRequest{
+		Scheme: scheme,
+		Layer:  first(params, "LAYER", "debug"),
+		Style:  first(params, "STYLE", "default"),
+		Zoom:   zoom, Row: row, Column: column,
+		Time: first(params, "TIME", ""), Extras: extras(params, wmtsCoreParameters),
+	})
+}
+
+func (s *Server) handleWMTSREST(w http.ResponseWriter, r *http.Request, parts []string) {
+	layer := "debug"
+	style := "default"
+	var schemeID, zoom, row, columnPath string
+	switch len(parts) {
+	case 4:
+		zoom, row, columnPath = parts[1], parts[2], parts[3]
+	case 5:
+		schemeID, zoom, row, columnPath = parts[1], parts[2], parts[3], parts[4]
+	case 7:
+		layer, style, schemeID = parts[1], parts[2], parts[3]
+		zoom, row, columnPath = parts[4], parts[5], parts[6]
+	default:
+		s.writeError(w, r, http.StatusBadRequest, "InvalidPath", "expected /wmts/{z}/{y}/{x}.png, /wmts/{scheme}/{z}/{y}/{x}.png or /wmts/{layer}/{style}/{scheme}/{z}/{y}/{x}.png")
+		return
+	}
+	column := trimPNG(columnPath)
+	if column == "" {
+		s.writeError(w, r, http.StatusBadRequest, "InvalidFormat", "WMTS tile path must end in .png")
+		return
+	}
+	scheme, err := s.resolveScheme(r.Context(), schemeID)
+	if err != nil {
+		s.writeStoreError(w, r, err)
+		return
+	}
+	params := normalizedQuery(r.URL.Query())
+	s.serveTile(w, r, tileRequest{
+		Scheme: scheme, Layer: layer, Style: style,
+		Zoom: zoom, Row: row, Column: column,
+		Time: first(params, "TIME", ""), Extras: extras(params, map[string]bool{"TIME": true}),
+	})
+}
+
+func (s *Server) handleWMS(w http.ResponseWriter, r *http.Request) {
+	params := normalizedQuery(r.URL.Query())
+	request := strings.ToUpper(first(params, "REQUEST", ""))
+	if r.URL.RawQuery == "" || request == "GETCAPABILITIES" {
+		s.writeWMSMetadata(w, r)
+		return
+	}
+	if request == "" {
+		request = "GETMAP"
+	}
+	if request != "GETMAP" {
+		s.writeError(w, r, http.StatusBadRequest, "OperationNotSupported", "supported WMS requests are GetMap and GetCapabilities")
+		return
+	}
+
+	width, err := boundedInt(first(params, "WIDTH", "256"), 8, 4096)
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "InvalidParameterValue", "WIDTH must be between 8 and 4096")
+		return
+	}
+	height, err := boundedInt(first(params, "HEIGHT", "256"), 8, 4096)
+	if err != nil || width*height > maxWMSPixels {
+		s.writeError(w, r, http.StatusBadRequest, "InvalidParameterValue", "HEIGHT must be between 8 and 4096 and total pixels must not exceed 16777216")
+		return
+	}
+	crs := first(params, "CRS", first(params, "SRS", "EPSG:3857"))
+	bbox := first(params, "BBOX", defaultBBOX(crs))
+	version := first(params, "VERSION", "1.3.0")
+	layers := first(params, "LAYERS", "debug")
+	format := first(params, "FORMAT", "image/png")
+	timeValue := first(params, "TIME", "")
+	lines := []string{
+		"service: WMS " + version,
+		"layers: " + layers,
+		"crs: " + crs,
+		"bbox: " + bbox,
+		fmt.Sprintf("size: %dx%d", width, height),
+		"format: " + format,
+	}
+	if timeValue != "" {
+		lines = append(lines, "time: "+timeValue)
+	}
+	lines = append(lines, extras(params, wmsCoreParameters)...)
+	s.writePNG(w, r, debugrender.Spec{Width: width, Height: height, Lines: lines})
+}
+
+type tileRequest struct {
+	Scheme            store.Scheme
+	Layer, Style      string
+	Zoom, Column, Row string
+	Time              string
+	Extras            []string
+}
+
+func (s *Server) serveTile(w http.ResponseWriter, r *http.Request, request tileRequest) {
+	level, ok := request.Scheme.Level(request.Zoom)
+	if !ok {
+		s.writeError(w, r, http.StatusBadRequest, "TileOutOfRange", "unknown tile matrix level "+request.Zoom)
+		return
+	}
+	column, err := strconv.ParseInt(request.Column, 10, 64)
+	if err != nil || column < 0 || column >= level.MatrixWidth {
+		s.writeError(w, r, http.StatusBadRequest, "TileOutOfRange", fmt.Sprintf("tile column must be between 0 and %d", level.MatrixWidth-1))
+		return
+	}
+	row, err := strconv.ParseInt(request.Row, 10, 64)
+	if err != nil || row < 0 || row >= level.MatrixHeight {
+		s.writeError(w, r, http.StatusBadRequest, "TileOutOfRange", fmt.Sprintf("tile row must be between 0 and %d", level.MatrixHeight-1))
+		return
+	}
+	bounds := request.Scheme.TileBounds(level, column, row)
+	lines := []string{
+		"layer: " + request.Layer,
+		"scheme: " + request.Scheme.ID,
+		"crs: " + request.Scheme.CRS,
+		fmt.Sprintf("z/x/y: %s/%d/%d", level.Identifier, column, row),
+		fmt.Sprintf("size: %dx%d", request.Scheme.TileWidth, request.Scheme.TileHeight),
+		fmt.Sprintf("min: %.6f, %.6f", bounds.MinX, bounds.MinY),
+		fmt.Sprintf("max: %.6f, %.6f", bounds.MaxX, bounds.MaxY),
+	}
+	if request.Time != "" {
+		lines = append(lines, "time: "+request.Time)
+	}
+	lines = append(lines, request.Extras...)
+	s.writePNG(w, r, debugrender.Spec{Width: request.Scheme.TileWidth, Height: request.Scheme.TileHeight, Lines: lines})
+}
+
+func (s *Server) resolveScheme(ctx context.Context, id string) (store.Scheme, error) {
+	if id == "" {
+		return s.store.DefaultScheme(ctx)
+	}
+	return s.store.Scheme(ctx, id)
+}
+
+func (s *Server) writePNG(w http.ResponseWriter, r *http.Request, spec debugrender.Spec) {
+	data, err := debugrender.PNG(spec)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "NoApplicableCode", err.Error())
+		return
+	}
+	writeResponse(w, r, http.StatusOK, "image/png", data)
+}
+
+func (s *Server) writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, store.ErrSchemeNotFound) {
+		s.writeError(w, r, http.StatusNotFound, "InvalidParameterValue", "unknown tile matrix set")
+		return
+	}
+	s.writeError(w, r, http.StatusInternalServerError, "NoApplicableCode", err.Error())
+}
+
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	type exception struct {
+		XMLName xml.Name `xml:"ExceptionReport"`
+		Code    string   `xml:"Exception>Code"`
+		Text    string   `xml:"Exception>Text"`
+	}
+	data, _ := xml.MarshalIndent(exception{Code: code, Text: message}, "", "  ")
+	data = append([]byte(xml.Header), data...)
+	writeResponse(w, r, status, "application/xml; charset=utf-8", data)
+}
+
+func writeResponse(w http.ResponseWriter, r *http.Request, status int, contentType string, data []byte) {
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(status)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(data)
+	}
+}
+
+func setCORS(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+}
+
+func splitPath(path string) []string {
+	trimmed := strings.Trim(path, "/")
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, "/")
+}
+
+func trimPNG(value string) string {
+	if len(value) <= 4 || !strings.EqualFold(value[len(value)-4:], ".png") {
+		return ""
+	}
+	return value[:len(value)-4]
+}
+
+func normalizedQuery(values url.Values) map[string][]string {
+	result := make(map[string][]string, len(values))
+	for key, value := range values {
+		upper := strings.ToUpper(key)
+		result[upper] = append(result[upper], value...)
+	}
+	return result
+}
+
+func first(params map[string][]string, key, fallback string) string {
+	values := params[key]
+	if len(values) == 0 || values[0] == "" {
+		return fallback
+	}
+	return values[0]
+}
+
+func required(params map[string][]string, key string) (string, bool) {
+	value := first(params, key, "")
+	return value, value != ""
+}
+
+func extras(params map[string][]string, excluded map[string]bool) []string {
+	keys := make([]string, 0, len(params))
+	for key := range params {
+		if !excluded[key] {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	result := make([]string, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, strings.ToLower(key)+": "+strings.Join(params[key], ", "))
+	}
+	return result
+}
+
+func boundedInt(value string, minimum, maximum int) (int, error) {
+	number, err := strconv.Atoi(value)
+	if err != nil || number < minimum || number > maximum {
+		return 0, fmt.Errorf("value must be between %d and %d", minimum, maximum)
+	}
+	return number, nil
+}
+
+func defaultBBOX(crs string) string {
+	if strings.EqualFold(crs, "EPSG:3857") {
+		return "-20037508.342789244,-20037508.342789244,20037508.342789244,20037508.342789244"
+	}
+	return "-180,-90,180,90"
+}
+
+var wmtsCoreParameters = map[string]bool{
+	"SERVICE": true, "REQUEST": true, "VERSION": true, "LAYER": true,
+	"STYLE": true, "FORMAT": true, "TILEMATRIXSET": true, "TILEMATRIX": true,
+	"TILEROW": true, "TILECOL": true, "TIME": true,
+}
+
+var wmsCoreParameters = map[string]bool{
+	"SERVICE": true, "REQUEST": true, "VERSION": true, "LAYERS": true,
+	"STYLES": true, "FORMAT": true, "TRANSPARENT": true, "CRS": true,
+	"SRS": true, "BBOX": true, "WIDTH": true, "HEIGHT": true, "TIME": true,
+}

@@ -1,0 +1,10 @@
+.git
+.gitignore
+.idea
+.vscode
+data
+*.db
+*.db-shm
+*.db-wal
+geo-debug-server
+geo-debug-server.exe
