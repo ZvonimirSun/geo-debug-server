@@ -23,6 +23,7 @@ type wmtsCapabilities struct {
 	ServiceIdentification owsServiceIdentification `xml:"ows:ServiceIdentification"`
 	OperationsMetadata    owsOperationsMetadata    `xml:"ows:OperationsMetadata"`
 	Contents              wmtsContents             `xml:"Contents"`
+	ServiceMetadataURLs   []wmtsServiceMetadataURL `xml:"ServiceMetadataURL"`
 }
 
 type owsServiceIdentification struct {
@@ -46,7 +47,7 @@ type owsDCP struct {
 }
 
 type owsHTTP struct {
-	Get owsGet `xml:"ows:Get"`
+	Gets []owsGet `xml:"ows:Get"`
 }
 
 type owsGet struct {
@@ -75,12 +76,18 @@ type wmtsContents struct {
 
 type wmtsLayer struct {
 	Title          string                  `xml:"ows:Title"`
+	WGS84Bounds    owsWGS84BoundingBox     `xml:"ows:WGS84BoundingBox"`
 	Identifier     string                  `xml:"ows:Identifier"`
 	BoundingBoxes  []owsBoundingBox        `xml:"ows:BoundingBox"`
 	Styles         []wmtsStyle             `xml:"Style"`
 	Formats        []string                `xml:"Format"`
 	MatrixSetLinks []wmtsTileMatrixSetLink `xml:"TileMatrixSetLink"`
 	ResourceURLs   []wmtsResourceURL       `xml:"ResourceURL"`
+}
+
+type owsWGS84BoundingBox struct {
+	LowerCorner string `xml:"ows:LowerCorner"`
+	UpperCorner string `xml:"ows:UpperCorner"`
 }
 
 type owsBoundingBox struct {
@@ -102,6 +109,10 @@ type wmtsResourceURL struct {
 	Format       string `xml:"format,attr"`
 	ResourceType string `xml:"resourceType,attr"`
 	Template     string `xml:"template,attr"`
+}
+
+type wmtsServiceMetadataURL struct {
+	Href string `xml:"xlink:href,attr"`
 }
 
 type wmtsTileMatrixSet struct {
@@ -285,6 +296,9 @@ func (s *Server) writeWMTSMetadata(w http.ResponseWriter, r *http.Request) {
 		}},
 		Contents: wmtsContents{Layer: wmtsLayer{
 			Title: "Geo Debug Layer", Identifier: "debug",
+			WGS84Bounds: owsWGS84BoundingBox{
+				LowerCorner: "-180 -90", UpperCorner: "180 90",
+			},
 			Styles:  []wmtsStyle{{IsDefault: true, Identifier: "default"}},
 			Formats: []string{"image/png"},
 			ResourceURLs: []wmtsResourceURL{{
@@ -292,11 +306,17 @@ func (s *Server) writeWMTSMetadata(w http.ResponseWriter, r *http.Request) {
 				Template: root + "/wmts/debug/default/{TileMatrixSet}/{TileMatrix}/{TileRow}/{TileCol}.png",
 			}},
 		}},
+		ServiceMetadataURLs: []wmtsServiceMetadataURL{
+			{Href: endpoint + "?SERVICE=WMTS&REQUEST=GetCapabilities&VERSION=1.0.0"},
+			{Href: endpoint + "/1.0.0/WMTSCapabilities.xml"},
+		},
 	}
 	for _, scheme := range schemes {
 		crs := wmtsCRS(scheme.CRS)
 		capabilities.Contents.Layer.BoundingBoxes = append(capabilities.Contents.Layer.BoundingBoxes, owsBoundingBox{
-			CRS: crs, LowerCorner: coordinatePair(scheme.MinX, scheme.MinY), UpperCorner: coordinatePair(scheme.MaxX, scheme.MaxY),
+			CRS:         crs,
+			LowerCorner: wmtsCoordinatePair(scheme.YCoordinateFirst, scheme.MinX, scheme.MinY),
+			UpperCorner: wmtsCoordinatePair(scheme.YCoordinateFirst, scheme.MaxX, scheme.MaxY),
 		})
 		capabilities.Contents.Layer.MatrixSetLinks = append(capabilities.Contents.Layer.MatrixSetLinks,
 			wmtsTileMatrixSetLink{TileMatrixSet: scheme.ID})
@@ -304,7 +324,7 @@ func (s *Server) writeWMTSMetadata(w http.ResponseWriter, r *http.Request) {
 		for _, level := range scheme.Levels {
 			matrixSet.Matrices = append(matrixSet.Matrices, wmtsTileMatrix{
 				Identifier: level.Identifier, ScaleDenominator: level.ScaleDenominator,
-				TopLeftCorner: coordinatePair(scheme.OriginX, scheme.OriginY),
+				TopLeftCorner: wmtsCoordinatePair(scheme.YCoordinateFirst, scheme.OriginX, scheme.OriginY),
 				TileWidth:     scheme.TileWidth, TileHeight: scheme.TileHeight,
 				MatrixWidth: level.MatrixWidth, MatrixHeight: level.MatrixHeight,
 			})
@@ -321,11 +341,15 @@ func (s *Server) writeWMTSMetadata(w http.ResponseWriter, r *http.Request) {
 }
 
 func wmtsOperation(name, endpoint string, parameters ...owsParameter) owsOperation {
-	return owsOperation{Name: name, Parameters: parameters, DCP: owsDCP{HTTP: owsHTTP{Get: owsGet{
-		Href: endpoint + "?", Constraint: owsConstraint{
-			Name: "GetEncoding", AllowedValues: owsAllowedValues{Values: []string{"KVP"}},
-		},
-	}}}}
+	gets := make([]owsGet, 0, 2)
+	for _, encoding := range []string{"RESTFUL", "KVP"} {
+		gets = append(gets, owsGet{
+			Href: endpoint + "?", Constraint: owsConstraint{
+				Name: "GetEncoding", AllowedValues: owsAllowedValues{Values: []string{encoding}},
+			},
+		})
+	}
+	return owsOperation{Name: name, Parameters: parameters, DCP: owsDCP{HTTP: owsHTTP{Gets: gets}}}
 }
 
 func owsParameterValues(name string, values ...string) owsParameter {
@@ -342,8 +366,11 @@ func wmtsCRS(value string) string {
 	return value
 }
 
-func coordinatePair(first, second float64) string {
-	return fmt.Sprintf("%.15g %.15g", first, second)
+func wmtsCoordinatePair(yCoordinateFirst bool, x, y float64) string {
+	if yCoordinateFirst {
+		return fmt.Sprintf("%.15g %.15g", y, x)
+	}
+	return fmt.Sprintf("%.15g %.15g", x, y)
 }
 
 func (s *Server) writeWMSMetadata(w http.ResponseWriter, r *http.Request, version string) {

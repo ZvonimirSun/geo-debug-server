@@ -105,6 +105,10 @@ func (s *Server) handleXYZ(w http.ResponseWriter, r *http.Request, relative stri
 }
 
 func (s *Server) handleWMTS(w http.ResponseWriter, r *http.Request, relative string) {
+	if strings.EqualFold(relative, "/wmts/1.0.0/WMTSCapabilities.xml") {
+		s.writeWMTSMetadata(w, r)
+		return
+	}
 	parts := splitPath(relative)
 	if len(parts) > 1 {
 		s.handleWMTSREST(w, r, parts)

@@ -19,6 +19,7 @@ import (
 const (
 	WebMercatorQuad       = "WebMercatorQuad"
 	WorldCRS84Quad        = "WorldCRS84Quad"
+	CGCS2000Quad          = "CGCS2000Quad"
 	DefaultSchemeCacheTTL = 5 * time.Minute
 )
 
@@ -28,21 +29,22 @@ var (
 )
 
 type Scheme struct {
-	ID         string
-	Name       string
-	CRS        string
-	TileWidth  int
-	TileHeight int
-	MinZoom    int
-	MaxZoom    int
-	OriginX    float64
-	OriginY    float64
-	MinX       float64
-	MinY       float64
-	MaxX       float64
-	MaxY       float64
-	IsDefault  bool
-	Levels     []MatrixLevel
+	ID               string
+	Name             string
+	CRS              string
+	TileWidth        int
+	TileHeight       int
+	MinZoom          int
+	MaxZoom          int
+	OriginX          float64
+	OriginY          float64
+	MinX             float64
+	MinY             float64
+	MaxX             float64
+	MaxY             float64
+	YCoordinateFirst bool
+	IsDefault        bool
+	Levels           []MatrixLevel
 }
 
 type MatrixLevel struct {
@@ -150,6 +152,14 @@ func (s *Store) init(ctx context.Context) error {
 		time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return fmt.Errorf("record schema version: %w", err)
 	}
+	if err := migrateYCoordinateFirst(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(2, ?)`,
+		time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return fmt.Errorf("record schema version: %w", err)
+	}
 	for _, scheme := range defaultSchemes() {
 		if err := seedScheme(ctx, tx, scheme); err != nil {
 			return err
@@ -161,16 +171,52 @@ func (s *Store) init(ctx context.Context) error {
 	return nil
 }
 
+func migrateYCoordinateFirst(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(tile_schemes)`)
+	if err != nil {
+		return fmt.Errorf("inspect tile scheme columns: %w", err)
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan tile scheme column: %w", err)
+		}
+		if strings.EqualFold(name, "y_coordinate_first") {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate tile scheme columns: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close tile scheme columns: %w", err)
+	}
+	if found {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		ALTER TABLE tile_schemes ADD COLUMN y_coordinate_first INTEGER NOT NULL DEFAULT 0
+		CHECK(y_coordinate_first IN (0, 1))`); err != nil {
+		return fmt.Errorf("add tile scheme axis order: %w", err)
+	}
+	return nil
+}
+
 func seedScheme(ctx context.Context, tx *sql.Tx, scheme Scheme) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO tile_schemes(
 			id, name, crs, tile_width, tile_height, min_zoom, max_zoom,
-			origin_x, origin_y, min_x, min_y, max_x, max_y, is_default
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			origin_x, origin_y, min_x, min_y, max_x, max_y, y_coordinate_first, is_default
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING`,
 		scheme.ID, scheme.Name, scheme.CRS, scheme.TileWidth, scheme.TileHeight,
 		scheme.MinZoom, scheme.MaxZoom, scheme.OriginX, scheme.OriginY,
-		scheme.MinX, scheme.MinY, scheme.MaxX, scheme.MaxY, scheme.IsDefault)
+		scheme.MinX, scheme.MinY, scheme.MaxX, scheme.MaxY, scheme.YCoordinateFirst, scheme.IsDefault)
 	if err != nil {
 		return fmt.Errorf("seed tile scheme %s: %w", scheme.ID, err)
 	}
@@ -216,13 +262,14 @@ func (s *Store) Scheme(ctx context.Context, id string) (Scheme, error) {
 func (s *Store) loadScheme(ctx context.Context, id string) (Scheme, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, name, crs, tile_width, tile_height, min_zoom, max_zoom,
-		       origin_x, origin_y, min_x, min_y, max_x, max_y, is_default
+		       origin_x, origin_y, min_x, min_y, max_x, max_y, y_coordinate_first, is_default
 		FROM tile_schemes WHERE lower(id) = lower(?)`, id)
 	var scheme Scheme
 	if err := row.Scan(
 		&scheme.ID, &scheme.Name, &scheme.CRS, &scheme.TileWidth, &scheme.TileHeight,
 		&scheme.MinZoom, &scheme.MaxZoom, &scheme.OriginX, &scheme.OriginY,
-		&scheme.MinX, &scheme.MinY, &scheme.MaxX, &scheme.MaxY, &scheme.IsDefault,
+		&scheme.MinX, &scheme.MinY, &scheme.MaxX, &scheme.MaxY,
+		&scheme.YCoordinateFirst, &scheme.IsDefault,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Scheme{}, ErrSchemeNotFound
@@ -458,6 +505,12 @@ func defaultSchemes() []Scheme {
 		TileWidth: 256, TileHeight: 256, MinZoom: 0, MaxZoom: 22,
 		OriginX: -180, OriginY: 90, MinX: -180, MinY: -90, MaxX: 180, MaxY: 90,
 	}
+	cgcs2000 := Scheme{
+		ID: CGCS2000Quad, Name: "CGCS2000 Quad", CRS: "EPSG:4490",
+		TileWidth: 256, TileHeight: 256, MinZoom: 0, MaxZoom: 22,
+		OriginX: -180, OriginY: 90, MinX: -180, MinY: -90, MaxX: 180, MaxY: 90,
+		YCoordinateFirst: true,
+	}
 	for zoom := 0; zoom <= 22; zoom++ {
 		factor := math.Exp2(float64(zoom))
 		mercator.Levels = append(mercator.Levels, MatrixLevel{
@@ -472,8 +525,14 @@ func defaultSchemes() []Scheme {
 			ScaleDenominator: 279541132.0143589 / factor,
 			MatrixWidth:      int64(2 * factor), MatrixHeight: int64(factor),
 		})
+		cgcs2000.Levels = append(cgcs2000.Levels, MatrixLevel{
+			Zoom: zoom, Identifier: fmt.Sprint(zoom),
+			Resolution:       0.703125 / factor,
+			ScaleDenominator: 279541132.0143589 / factor,
+			MatrixWidth:      int64(2 * factor), MatrixHeight: int64(factor),
+		})
 	}
-	return []Scheme{mercator, crs84}
+	return []Scheme{mercator, crs84, cgcs2000}
 }
 
 const schemaSQL = `
@@ -496,6 +555,7 @@ CREATE TABLE IF NOT EXISTS tile_schemes (
     min_y REAL NOT NULL,
     max_x REAL NOT NULL,
     max_y REAL NOT NULL,
+    y_coordinate_first INTEGER NOT NULL DEFAULT 0 CHECK(y_coordinate_first IN (0, 1)),
     is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0, 1))
 );
 

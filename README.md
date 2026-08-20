@@ -44,6 +44,7 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 | `GET` / `HEAD` | `/xyz/{z}/{x}/{y}.png` | 使用默认切片方案生成 XYZ 调试瓦片 |
 | `GET` / `HEAD` | `/xyz/{scheme}/{z}/{x}/{y}.png` | 使用指定切片方案生成 XYZ 调试瓦片 |
 | `GET` / `HEAD` | `/wmts` | 返回 WMTS 1.0.0 Capabilities，包含操作、默认参数、图层、切片方案和 `ResourceURL` |
+| `GET` / `HEAD` | `/wmts/1.0.0/WMTSCapabilities.xml` | 通过 REST 路径返回 WMTS 1.0.0 Capabilities |
 | `GET` / `HEAD` | `/wmts?TILEMATRIX={z}&TILEROW={y}&TILECOL={x}` | 通过 KVP 参数生成 WMTS 调试瓦片 |
 | `GET` / `HEAD` | `/wmts/{z}/{y}/{x}.png` | 使用默认图层、样式和切片方案生成 WMTS 调试瓦片 |
 | `GET` / `HEAD` | `/wmts/{scheme}/{z}/{y}/{x}.png` | 使用指定切片方案和默认图层、样式生成 WMTS 调试瓦片 |
@@ -65,8 +66,9 @@ XYZ 直接通过路径生成瓦片，不提供 Capabilities；WMTS 和 WMS 提�
 | --- | --- | --- | --- | --- |
 | `WebMercatorQuad` | `EPSG:3857` | 1x1 | 0-22 | 256x256 |
 | `WorldCRS84Quad` | `CRS:84` | 2x1 | 0-22 | 256x256 |
+| `CGCS2000Quad` | `EPSG:4490` | 2x1 | 0-22 | 256x256 |
 
-切片方案保存在 `tile_schemes`，每一级参数保存在 `tile_matrix_levels`。首版不提供管理 API，可以直接查看 SQLite 数据确认方案参数。
+切片方案保存在 `tile_schemes`，每一级参数保存在 `tile_matrix_levels`。`tile_schemes.y_coordinate_first` 用于指定 WMTS 元数据是否按 y/x 输出坐标；值为 `1` 时交换内部 x/y 顺序，值为 `0` 时保持 x/y。首版不提供管理 API，可以直接查看 SQLite 数据确认方案参数。
 
 服务会在进程内缓存查询成功的切片方案及层级信息，默认滑动 TTL 为 5 分钟。每次命中都会重新续期；超过 TTL 未访问的方案会自动从内存释放，下次请求重新读取 SQLite。并发缓存 miss 只会执行一次 SQLite 加载。直接修改数据库后，变更最迟在对应缓存停止访问并过期后可见。
 
@@ -133,7 +135,7 @@ http://localhost:8080/geo-debug-server/wmts?TILEMATRIX=2&TILEROW=1&TILECOL=1
 http://localhost:8080/geo-debug-server/wmts
 ```
 
-WMTS 支持 1.0.0。该响应使用 WMTS 1.0.0 和 OWS 1.1 标准命名空间及结构，包含 `GetCapabilities`、`GetTile`、KVP 编码支持、默认图层/样式/格式、REST 资源模板、可用矩阵集和完整瓦片矩阵。服务商、联系人、关键词及 `GetFeatureInfo` 等与调试瓦片无关的信息已省略。
+WMTS 支持 1.0.0。该响应使用 WMTS 1.0.0 和 OWS 1.1 标准命名空间及结构，包含 `GetCapabilities`、`GetTile`、KVP/RESTFUL 编码声明、WGS84 范围、默认图层/样式/格式、REST 资源模板、服务元数据地址、可用矩阵集和完整瓦片矩阵。`WGS84BoundingBox` 固定使用经度、纬度顺序；`TopLeftCorner` 遵循矩阵集 CRS 的轴顺序，因此 `EPSG:4326` 为纬度、经度，而 `CRS:84` 为经度、纬度。服务商、联系人、关键词及 `GetFeatureInfo` 等与调试瓦片无关的信息已省略。
 
 ## WMS
 

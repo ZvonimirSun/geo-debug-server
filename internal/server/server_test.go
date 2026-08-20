@@ -50,6 +50,8 @@ func TestXYZForLeaflet(t *testing.T) {
 
 	crs84 := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/WorldCRS84Quad/0/1/0.png")
 	assertPNG(t, crs84, 256, 256)
+	cgcs2000 := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/CGCS2000Quad/0/1/0.png")
+	assertPNG(t, cgcs2000, 256, 256)
 	outOfRange := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/WorldCRS84Quad/0/2/0.png")
 	if outOfRange.Code != http.StatusBadRequest {
 		t.Fatalf("expected out-of-range status 400, got %d", outOfRange.Code)
@@ -111,7 +113,7 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 				} `xml:"Parameter"`
 				DCP struct {
 					HTTP struct {
-						Get struct {
+						Gets []struct {
 							Href       string `xml:"http://www.w3.org/1999/xlink href,attr"`
 							Constraint struct {
 								Name   string   `xml:"name,attr"`
@@ -124,8 +126,12 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 		} `xml:"OperationsMetadata"`
 		Contents struct {
 			Layer struct {
-				Identifier string `xml:"Identifier"`
-				Styles     []struct {
+				Identifier  string `xml:"Identifier"`
+				WGS84Bounds struct {
+					LowerCorner string `xml:"LowerCorner"`
+					UpperCorner string `xml:"UpperCorner"`
+				} `xml:"WGS84BoundingBox"`
+				Styles []struct {
 					IsDefault  bool   `xml:"isDefault,attr"`
 					Identifier string `xml:"Identifier"`
 				} `xml:"Style"`
@@ -150,6 +156,9 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 				} `xml:"TileMatrix"`
 			} `xml:"TileMatrixSet"`
 		} `xml:"Contents"`
+		MetadataURLs []struct {
+			Href string `xml:"http://www.w3.org/1999/xlink href,attr"`
+		} `xml:"ServiceMetadataURL"`
 	}
 	if err := xml.Unmarshal(wmts.Body.Bytes(), &wmtsDocument); err != nil {
 		t.Fatalf("WMTS metadata is not XML: %v", err)
@@ -160,7 +169,7 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 	body := wmts.Body.String()
 	for _, expected := range []string{
 		`xmlns="http://www.opengis.net/wmts/1.0"`, `xmlns:ows="http://www.opengis.net/ows/1.1"`,
-		"<Contents>", "<ows:Identifier>", "WebMercatorQuad", "WorldCRS84Quad", "ResourceURL",
+		"<Contents>", "<ows:Identifier>", "WebMercatorQuad", "WorldCRS84Quad", "CGCS2000Quad", "ResourceURL",
 		"http://maps.example.test/geo-debug-server/wmts",
 	} {
 		if !strings.Contains(body, expected) {
@@ -171,12 +180,21 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 		t.Fatalf("unexpected WMTS service metadata: %+v", wmtsDocument.Service)
 	}
 	for _, operation := range wmtsDocument.Operations.Items {
-		if operation.DCP.HTTP.Get.Href != "http://maps.example.test/geo-debug-server/wmts?" {
-			t.Fatalf("unexpected %s operation URL: %q", operation.Name, operation.DCP.HTTP.Get.Href)
+		if len(operation.DCP.HTTP.Gets) != 2 {
+			t.Fatalf("expected RESTFUL and KVP endpoints for %s: %+v", operation.Name, operation.DCP.HTTP.Gets)
 		}
-		constraint := operation.DCP.HTTP.Get.Constraint
-		if constraint.Name != "GetEncoding" || len(constraint.Values) != 1 || constraint.Values[0] != "KVP" {
-			t.Fatalf("unexpected %s encoding constraint: %+v", operation.Name, constraint)
+		encodings := make([]string, 0, len(operation.DCP.HTTP.Gets))
+		for _, get := range operation.DCP.HTTP.Gets {
+			if get.Href != "http://maps.example.test/geo-debug-server/wmts?" {
+				t.Fatalf("unexpected %s operation URL: %q", operation.Name, get.Href)
+			}
+			if get.Constraint.Name != "GetEncoding" || len(get.Constraint.Values) != 1 {
+				t.Fatalf("unexpected %s encoding constraint: %+v", operation.Name, get.Constraint)
+			}
+			encodings = append(encodings, get.Constraint.Values[0])
+		}
+		if strings.Join(encodings, ",") != "RESTFUL,KVP" {
+			t.Fatalf("unexpected %s encodings: %v", operation.Name, encodings)
 		}
 		parameters := make(map[string][]string, len(operation.Parameters))
 		for _, parameter := range operation.Parameters {
@@ -189,7 +207,7 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 			}
 		case "GetTile":
 			if strings.Join(parameters["Layer"], ",") != "debug" || strings.Join(parameters["Style"], ",") != "default" ||
-				strings.Join(parameters["Format"], ",") != "image/png" || len(parameters["TileMatrixSet"]) != 2 {
+				strings.Join(parameters["Format"], ",") != "image/png" || len(parameters["TileMatrixSet"]) != 3 {
 				t.Fatalf("incomplete GetTile parameters: %+v", parameters)
 			}
 		default:
@@ -200,7 +218,10 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 	if layer.Identifier != "debug" || len(layer.Styles) != 1 || !layer.Styles[0].IsDefault || layer.Styles[0].Identifier != "default" {
 		t.Fatalf("unexpected WMTS layer identity or style: %+v", layer)
 	}
-	if len(layer.Formats) != 1 || layer.Formats[0] != "image/png" || len(layer.MatrixLinks) != 2 || len(layer.ResourceURLs) != 1 {
+	if layer.WGS84Bounds.LowerCorner != "-180 -90" || layer.WGS84Bounds.UpperCorner != "180 90" {
+		t.Fatalf("WGS84BoundingBox must use longitude/latitude order: %+v", layer.WGS84Bounds)
+	}
+	if len(layer.Formats) != 1 || layer.Formats[0] != "image/png" || len(layer.MatrixLinks) != 3 || len(layer.ResourceURLs) != 1 {
 		t.Fatalf("unexpected WMTS layer resources: %+v", layer)
 	}
 	resourceURL := layer.ResourceURLs[0]
@@ -208,12 +229,18 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 	if resourceURL.ResourceType != "tile" || resourceURL.Template != expectedTemplate || strings.Contains(resourceURL.Template, "?") {
 		t.Fatalf("ResourceURL must be a REST tile template: %+v", resourceURL)
 	}
-	if len(wmtsDocument.Contents.MatrixSets) != 2 {
-		t.Fatalf("expected two tile matrix sets, got %d", len(wmtsDocument.Contents.MatrixSets))
+	if len(wmtsDocument.Contents.MatrixSets) != 3 {
+		t.Fatalf("expected three tile matrix sets, got %d", len(wmtsDocument.Contents.MatrixSets))
 	}
 	expectedCRS := map[string]string{
 		"WebMercatorQuad": "urn:ogc:def:crs:EPSG::3857",
 		"WorldCRS84Quad":  "urn:ogc:def:crs:OGC:1.3:CRS84",
+		"CGCS2000Quad":    "urn:ogc:def:crs:EPSG::4490",
+	}
+	expectedTopLeft := map[string]string{
+		"WebMercatorQuad": "-20037508.3427892 20037508.3427892",
+		"WorldCRS84Quad":  "-180 90",
+		"CGCS2000Quad":    "90 -180",
 	}
 	for _, matrixSet := range wmtsDocument.Contents.MatrixSets {
 		if len(matrixSet.Matrices) != 23 || matrixSet.Matrices[0].Identifier != "0" ||
@@ -224,6 +251,14 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 		if matrixSet.SupportedCRS != expectedCRS[matrixSet.Identifier] {
 			t.Fatalf("unexpected supported CRS for %s: %q", matrixSet.Identifier, matrixSet.SupportedCRS)
 		}
+		if matrixSet.Matrices[0].TopLeftCorner != expectedTopLeft[matrixSet.Identifier] {
+			t.Fatalf("unexpected top-left corner for %s: %q", matrixSet.Identifier, matrixSet.Matrices[0].TopLeftCorner)
+		}
+	}
+	if len(wmtsDocument.MetadataURLs) != 2 ||
+		wmtsDocument.MetadataURLs[0].Href != "http://maps.example.test/geo-debug-server/wmts?SERVICE=WMTS&REQUEST=GetCapabilities&VERSION=1.0.0" ||
+		wmtsDocument.MetadataURLs[1].Href != "http://maps.example.test/geo-debug-server/wmts/1.0.0/WMTSCapabilities.xml" {
+		t.Fatalf("unexpected WMTS service metadata URLs: %+v", wmtsDocument.MetadataURLs)
 	}
 	if strings.Contains(body, "<Extent>") || strings.Contains(body, "<KVPResourceURL>") || strings.Contains(body, "<TileMatrix id=") {
 		t.Fatal("WMTS capabilities contains legacy non-standard elements")
@@ -231,6 +266,19 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 	second := perform(t, handler, http.MethodGet, "/geo-debug-server/wmts?REQUEST=GetCapabilities")
 	if !bytes.Equal(wmts.Body.Bytes(), second.Body.Bytes()) {
 		t.Fatal("equivalent WMTS capabilities requests returned different metadata")
+	}
+	rest := perform(t, handler, http.MethodGet, "/geo-debug-server/wmts/1.0.0/WMTSCapabilities.xml")
+	if !bytes.Equal(wmts.Body.Bytes(), rest.Body.Bytes()) {
+		t.Fatal("REST WMTS capabilities request returned different metadata")
+	}
+}
+
+func TestWMTSCoordinatePairAxisOrder(t *testing.T) {
+	if actual := wmtsCoordinatePair(true, -180, 90); actual != "90 -180" {
+		t.Fatalf("y-coordinate-first scheme must use y/x order, got %q", actual)
+	}
+	if actual := wmtsCoordinatePair(false, -180, 90); actual != "-180 90" {
+		t.Fatalf("x-coordinate-first scheme must use x/y order, got %q", actual)
 	}
 }
 
