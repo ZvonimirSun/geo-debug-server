@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -63,19 +64,17 @@ type Bounds struct {
 type Store struct {
 	db *sql.DB
 
-	cacheMu       sync.Mutex
-	cache         map[string]*schemeCacheEntry
-	cacheTTL      time.Duration
-	cacheSequence uint64
-	schemeLoads   uint64
-	closed        bool
+	cacheMu     sync.RWMutex
+	cache       map[string]*schemeCacheEntry
+	cacheTTL    time.Duration
+	schemeLoads uint64
+	closed      bool
 }
 
 type schemeCacheEntry struct {
-	scheme     Scheme
-	expiresAt  time.Time
-	generation uint64
-	timer      *time.Timer
+	scheme    Scheme
+	expiresAt atomic.Int64
+	timer     *time.Timer
 }
 
 func Open(ctx context.Context, databasePath string) (*Store, error) {
@@ -191,12 +190,18 @@ func seedScheme(ctx context.Context, tx *sql.Tx, scheme Scheme) error {
 
 func (s *Store) Scheme(ctx context.Context, id string) (Scheme, error) {
 	key := schemeCacheKey(id)
+	if scheme, ok, err := s.cachedScheme(key); err != nil {
+		return Scheme{}, err
+	} else if ok {
+		return scheme, nil
+	}
+
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
 	if s.closed {
 		return Scheme{}, ErrStoreClosed
 	}
-	if scheme, ok := s.cachedSchemeLocked(key); ok {
+	if scheme, ok := s.cachedSchemeLocked(key, time.Now()); ok {
 		return cloneScheme(scheme), nil
 	}
 	scheme, err := s.loadScheme(ctx, id)
@@ -234,12 +239,18 @@ func (s *Store) loadScheme(ctx context.Context, id string) (Scheme, error) {
 
 func (s *Store) DefaultScheme(ctx context.Context) (Scheme, error) {
 	const defaultCacheKey = "\x00default"
+	if scheme, ok, err := s.cachedScheme(defaultCacheKey); err != nil {
+		return Scheme{}, err
+	} else if ok {
+		return scheme, nil
+	}
+
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
 	if s.closed {
 		return Scheme{}, ErrStoreClosed
 	}
-	if scheme, ok := s.cachedSchemeLocked(defaultCacheKey); ok {
+	if scheme, ok := s.cachedSchemeLocked(defaultCacheKey, time.Now()); ok {
 		return cloneScheme(scheme), nil
 	}
 	row := s.db.QueryRowContext(ctx, `
@@ -252,7 +263,7 @@ func (s *Store) DefaultScheme(ctx context.Context) (Scheme, error) {
 		return Scheme{}, fmt.Errorf("query default tile scheme: %w", err)
 	}
 	key := schemeCacheKey(id)
-	scheme, ok := s.cachedSchemeLocked(key)
+	scheme, ok := s.cachedSchemeLocked(key, time.Now())
 	if !ok {
 		loaded, err := s.loadScheme(ctx, id)
 		if err != nil {
@@ -291,7 +302,7 @@ func (s *Store) Schemes(ctx context.Context) ([]Scheme, error) {
 	result := make([]Scheme, 0, len(ids))
 	for _, id := range ids {
 		key := schemeCacheKey(id)
-		scheme, ok := s.cachedSchemeLocked(key)
+		scheme, ok := s.cachedSchemeLocked(key, time.Now())
 		if !ok {
 			scheme, err = s.loadScheme(ctx, id)
 			if err != nil {
@@ -332,7 +343,34 @@ func schemeCacheKey(id string) string {
 	return strings.ToLower(id)
 }
 
-func (s *Store) cachedSchemeLocked(key string) (Scheme, bool) {
+func (s *Store) cachedScheme(key string) (Scheme, bool, error) {
+	now := time.Now()
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+	if s.closed {
+		return Scheme{}, false, ErrStoreClosed
+	}
+	if s.cacheTTL <= 0 {
+		return Scheme{}, false, nil
+	}
+	entry := s.cache[key]
+	if entry == nil || now.UnixNano() >= entry.expiresAt.Load() {
+		return Scheme{}, false, nil
+	}
+	extendSchemeExpiry(entry, now.Add(s.cacheTTL).UnixNano())
+	return cloneScheme(entry.scheme), true, nil
+}
+
+func extendSchemeExpiry(entry *schemeCacheEntry, expiresAt int64) {
+	for {
+		current := entry.expiresAt.Load()
+		if current >= expiresAt || entry.expiresAt.CompareAndSwap(current, expiresAt) {
+			return
+		}
+	}
+}
+
+func (s *Store) cachedSchemeLocked(key string, now time.Time) (Scheme, bool) {
 	if s.cacheTTL <= 0 {
 		return Scheme{}, false
 	}
@@ -340,15 +378,14 @@ func (s *Store) cachedSchemeLocked(key string) (Scheme, bool) {
 	if !ok {
 		return Scheme{}, false
 	}
-	now := time.Now()
-	if !now.Before(entry.expiresAt) {
+	if now.UnixNano() >= entry.expiresAt.Load() {
 		if entry.timer != nil {
 			entry.timer.Stop()
 		}
 		delete(s.cache, key)
 		return Scheme{}, false
 	}
-	s.scheduleExpiryLocked(key, entry, now)
+	entry.expiresAt.Store(now.Add(s.cacheTTL).UnixNano())
 	return entry.scheme, true
 }
 
@@ -360,31 +397,26 @@ func (s *Store) cacheSchemeLocked(key string, scheme Scheme) {
 		existing.timer.Stop()
 	}
 	entry := &schemeCacheEntry{scheme: cloneScheme(scheme)}
+	entry.expiresAt.Store(time.Now().Add(s.cacheTTL).UnixNano())
 	s.cache[key] = entry
-	s.scheduleExpiryLocked(key, entry, time.Now())
-}
-
-func (s *Store) scheduleExpiryLocked(key string, entry *schemeCacheEntry, now time.Time) {
-	if entry.timer != nil {
-		entry.timer.Stop()
-	}
-	s.cacheSequence++
-	entry.generation = s.cacheSequence
-	entry.expiresAt = now.Add(s.cacheTTL)
-	generation := entry.generation
 	entry.timer = time.AfterFunc(s.cacheTTL, func() {
-		s.expireScheme(key, generation)
+		s.expireScheme(key, entry)
 	})
 }
 
-func (s *Store) expireScheme(key string, generation uint64) {
+func (s *Store) expireScheme(key string, expected *schemeCacheEntry) {
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
 	if s.closed {
 		return
 	}
 	entry := s.cache[key]
-	if entry == nil || entry.generation != generation || time.Now().Before(entry.expiresAt) {
+	if entry == nil || entry != expected {
+		return
+	}
+	remaining := time.Until(time.Unix(0, entry.expiresAt.Load()))
+	if remaining > 0 {
+		entry.timer.Reset(remaining)
 		return
 	}
 	delete(s.cache, key)

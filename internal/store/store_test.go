@@ -228,6 +228,82 @@ func TestConcurrentSchemeCacheMissLoadsOnce(t *testing.T) {
 	}
 }
 
+func TestConcurrentSchemeCacheHitsReuseTimer(t *testing.T) {
+	database, err := OpenWithCacheTTL(context.Background(), filepath.Join(t.TempDir(), "cache-hits.db"), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := database.Scheme(context.Background(), WebMercatorQuad); err != nil {
+		t.Fatal(err)
+	}
+
+	key := schemeCacheKey(WebMercatorQuad)
+	database.cacheMu.RLock()
+	initialTimer := database.cache[key].timer
+	database.cacheMu.RUnlock()
+
+	const workers = 128
+	const hitsPerWorker = 100
+	start := make(chan struct{})
+	errorsChannel := make(chan error, workers)
+	var group sync.WaitGroup
+	group.Add(workers)
+	for range workers {
+		go func() {
+			defer group.Done()
+			<-start
+			for range hitsPerWorker {
+				if _, err := database.Scheme(context.Background(), WebMercatorQuad); err != nil {
+					errorsChannel <- err
+					return
+				}
+			}
+			errorsChannel <- nil
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(errorsChannel)
+	for err := range errorsChannel {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	database.cacheMu.RLock()
+	entry := database.cache[key]
+	loads := database.schemeLoads
+	database.cacheMu.RUnlock()
+	if entry == nil || entry.timer != initialTimer {
+		t.Fatal("cache hits replaced the entry expiration timer")
+	}
+	if loads != 1 {
+		t.Fatalf("cache hits loaded SQLite %d times", loads)
+	}
+}
+
+func BenchmarkSchemeCacheHitParallel(b *testing.B) {
+	database, err := OpenWithCacheTTL(context.Background(), filepath.Join(b.TempDir(), "cache-benchmark.db"), time.Minute)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := database.Scheme(context.Background(), WebMercatorQuad); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(parallel *testing.PB) {
+		for parallel.Next() {
+			if _, err := database.Scheme(context.Background(), WebMercatorQuad); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+}
+
 func TestDefaultSchemeCacheExpiresAndReloadsSelection(t *testing.T) {
 	ctx := context.Background()
 	database, err := OpenWithCacheTTL(ctx, filepath.Join(t.TempDir(), "default-cache.db"), 50*time.Millisecond)
