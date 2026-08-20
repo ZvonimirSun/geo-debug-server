@@ -43,16 +43,19 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 | --- | --- | --- |
 | `GET` / `HEAD` | `/xyz/{z}/{x}/{y}.png` | 使用默认切片方案生成 XYZ 调试瓦片 |
 | `GET` / `HEAD` | `/xyz/{scheme}/{z}/{x}/{y}.png` | 使用指定切片方案生成 XYZ 调试瓦片 |
-| `GET` / `HEAD` | `/wmts` | 返回图层、切片方案和 `ResourceURL` 等 WMTS 元数据 |
+| `GET` / `HEAD` | `/wmts` | 返回 WMTS 1.0.0 Capabilities，包含操作、默认参数、图层、切片方案和 `ResourceURL` |
 | `GET` / `HEAD` | `/wmts?TILEMATRIX={z}&TILEROW={y}&TILECOL={x}` | 通过 KVP 参数生成 WMTS 调试瓦片 |
 | `GET` / `HEAD` | `/wmts/{z}/{y}/{x}.png` | 使用默认图层、样式和切片方案生成 WMTS 调试瓦片 |
 | `GET` / `HEAD` | `/wmts/{scheme}/{z}/{y}/{x}.png` | 使用指定切片方案和默认图层、样式生成 WMTS 调试瓦片 |
 | `GET` / `HEAD` | `/wmts/{layer}/{style}/{scheme}/{z}/{y}/{x}.png` | 通过 REST 路径生成 WMTS 调试瓦片 |
-| `GET` / `HEAD` | `/wms` | 返回图层、坐标系和 `GetMap` 资源模板等 WMS 元数据 |
+| `GET` / `HEAD` | `/wms` | 返回默认的 WMS 1.3.0 Capabilities，包含操作、默认图层和样式、坐标系、范围及尺寸限制 |
+| `GET` / `HEAD` | `/wms?REQUEST=GetCapabilities&VERSION=1.1.1` | 返回 WMS 1.1.1 Capabilities |
 | `GET` / `HEAD` | `/wms?REQUEST=GetMap&WIDTH={width}&HEIGHT={height}&...` | 按请求尺寸和参数生成 WMS 调试图片 |
 | `OPTIONS` | 以上全部端点 | 返回跨域预检响应 |
 
 `GET` 返回响应正文；`HEAD` 返回相同响应头但不返回正文。修改 `-base-path` 或 `GEO_DEBUG_BASE_PATH` 后，使用配置后的基础路径替换上述默认前缀。
+
+XYZ 直接通过路径生成瓦片，不提供 Capabilities；WMTS 和 WMS 提供可由客户端解析的标准 Capabilities。
 
 ## 默认切片方案
 
@@ -130,15 +133,19 @@ http://localhost:8080/geo-debug-server/wmts?TILEMATRIX=2&TILEROW=1&TILECOL=1
 http://localhost:8080/geo-debug-server/wmts
 ```
 
+WMTS 支持 1.0.0。该响应使用 WMTS 1.0.0 和 OWS 1.1 标准命名空间及结构，包含 `GetCapabilities`、`GetTile`、KVP 编码支持、默认图层/样式/格式、REST 资源模板、可用矩阵集和完整瓦片矩阵。服务商、联系人、关键词及 `GetFeatureInfo` 等与调试瓦片无关的信息已省略。
+
 ## WMS
 
-`GetMap` 支持常见 WMS 1.1.1/1.3.0 参数。`WIDTH`、`HEIGHT` 缺省为 256，`CRS/SRS` 缺省为 `EPSG:3857`，`BBOX` 缺省为对应坐标系的全球范围。
+WMS 支持 1.3.0 和 1.1.1，缺省版本为 1.3.0。`GetMap` 支持两个版本的常见参数；`WIDTH`、`HEIGHT` 缺省为 256，`CRS/SRS` 缺省为 `EPSG:3857`，`BBOX` 缺省为对应版本和坐标系的全球范围。
 
 ```text
 http://localhost:8080/geo-debug-server/wms?REQUEST=GetMap&LAYERS=debug&CRS=EPSG:3857&BBOX=0,0,1000,1000&WIDTH=512&HEIGHT=256
 ```
 
-打开 `/geo-debug-server/wms` 可以查看图层、支持的坐标系和 `GetMap` 资源模板。
+打开 `/geo-debug-server/wms` 可以查看标准 WMS 1.3.0 Capabilities；指定 `VERSION=1.1.1` 可以查看 WMS 1.1.1 Capabilities。响应包含 `GetCapabilities`、`GetMap`、默认图层 `debug`、默认样式 `default`、PNG 格式和支持的坐标系与范围。WMS 1.3.0 还声明最大宽高 4096 像素限制。服务商和联系人等与请求无关的信息已省略。
+
+XYZ 是路径式调试切片接口，不定义协议版本，也不提供 Capabilities。
 
 ## 调试参数
 

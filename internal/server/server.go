@@ -112,6 +112,16 @@ func (s *Server) handleWMTS(w http.ResponseWriter, r *http.Request, relative str
 	}
 	params := normalizedQuery(r.URL.Query())
 	request := strings.ToUpper(first(params, "REQUEST", ""))
+	version := first(params, "VERSION", "")
+	if request == "GETCAPABILITIES" || r.URL.RawQuery == "" {
+		version = first(params, "ACCEPTVERSIONS", first(params, "VERSION", "1.0.0"))
+	} else if version == "" {
+		version = "1.0.0"
+	}
+	if version != "1.0.0" {
+		s.writeError(w, r, http.StatusBadRequest, "InvalidParameterValue", "supported WMTS version is 1.0.0")
+		return
+	}
 	if r.URL.RawQuery == "" || request == "GETCAPABILITIES" {
 		s.writeWMTSMetadata(w, r)
 		return
@@ -183,8 +193,13 @@ func (s *Server) handleWMTSREST(w http.ResponseWriter, r *http.Request, parts []
 func (s *Server) handleWMS(w http.ResponseWriter, r *http.Request) {
 	params := normalizedQuery(r.URL.Query())
 	request := strings.ToUpper(first(params, "REQUEST", ""))
+	version := first(params, "VERSION", "1.3.0")
+	if version != "1.3.0" && version != "1.1.1" {
+		s.writeError(w, r, http.StatusBadRequest, "InvalidParameterValue", "supported WMS versions are 1.3.0 and 1.1.1")
+		return
+	}
 	if r.URL.RawQuery == "" || request == "GETCAPABILITIES" {
-		s.writeWMSMetadata(w, r)
+		s.writeWMSMetadata(w, r, version)
 		return
 	}
 	if request == "" {
@@ -206,8 +221,7 @@ func (s *Server) handleWMS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	crs := first(params, "CRS", first(params, "SRS", "EPSG:3857"))
-	bbox := first(params, "BBOX", defaultBBOX(crs))
-	version := first(params, "VERSION", "1.3.0")
+	bbox := first(params, "BBOX", defaultBBOX(crs, version))
 	layers := first(params, "LAYERS", "debug")
 	format := first(params, "FORMAT", "image/png")
 	timeValue := first(params, "TIME", "")
@@ -398,9 +412,12 @@ func boundedInt(value string, minimum, maximum int) (int, error) {
 	return number, nil
 }
 
-func defaultBBOX(crs string) string {
+func defaultBBOX(crs, version string) string {
 	if strings.EqualFold(crs, "EPSG:3857") {
 		return "-20037508.342789244,-20037508.342789244,20037508.342789244,20037508.342789244"
+	}
+	if version == "1.3.0" && strings.EqualFold(crs, "EPSG:4326") {
+		return "-90,-180,90,180"
 	}
 	return "-180,-90,180,90"
 }
