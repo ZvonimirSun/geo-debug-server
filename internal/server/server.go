@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"image/color"
 	"net/http"
 	"net/url"
 	"sort"
@@ -98,9 +99,9 @@ func (s *Server) handleXYZ(w http.ResponseWriter, r *http.Request, relative stri
 	}
 	params := normalizedQuery(r.URL.Query())
 	s.serveTile(w, r, tileRequest{
-		Scheme: scheme, Layer: "debug", Style: "default",
-		Zoom: zoomText, Column: columnText, Row: rowText,
-		Time: first(params, "TIME", ""), Extras: extras(params, map[string]bool{"TIME": true}),
+		Scheme: scheme,
+		Zoom:   zoomText, Column: columnText, Row: rowText,
+		Time: first(params, "TIME", ""), Params: params,
 	})
 }
 
@@ -153,16 +154,12 @@ func (s *Server) handleWMTS(w http.ResponseWriter, r *http.Request, relative str
 	}
 	s.serveTile(w, r, tileRequest{
 		Scheme: scheme,
-		Layer:  first(params, "LAYER", "debug"),
-		Style:  first(params, "STYLE", "default"),
 		Zoom:   zoom, Row: row, Column: column,
-		Time: first(params, "TIME", ""), Extras: extras(params, wmtsCoreParameters),
+		Time: first(params, "TIME", ""), Params: params,
 	})
 }
 
 func (s *Server) handleWMTSREST(w http.ResponseWriter, r *http.Request, parts []string) {
-	layer := "debug"
-	style := "default"
 	var schemeID, zoom, row, columnPath string
 	switch len(parts) {
 	case 4:
@@ -170,7 +167,7 @@ func (s *Server) handleWMTSREST(w http.ResponseWriter, r *http.Request, parts []
 	case 5:
 		schemeID, zoom, row, columnPath = parts[1], parts[2], parts[3], parts[4]
 	case 7:
-		layer, style, schemeID = parts[1], parts[2], parts[3]
+		schemeID = parts[3]
 		zoom, row, columnPath = parts[4], parts[5], parts[6]
 	default:
 		s.writeError(w, r, http.StatusBadRequest, "InvalidPath", "expected /wmts/{z}/{y}/{x}.png, /wmts/{scheme}/{z}/{y}/{x}.png or /wmts/{layer}/{style}/{scheme}/{z}/{y}/{x}.png")
@@ -188,9 +185,9 @@ func (s *Server) handleWMTSREST(w http.ResponseWriter, r *http.Request, parts []
 	}
 	params := normalizedQuery(r.URL.Query())
 	s.serveTile(w, r, tileRequest{
-		Scheme: scheme, Layer: layer, Style: style,
-		Zoom: zoom, Row: row, Column: column,
-		Time: first(params, "TIME", ""), Extras: extras(params, map[string]bool{"TIME": true}),
+		Scheme: scheme,
+		Zoom:   zoom, Row: row, Column: column,
+		Time: first(params, "TIME", ""), Params: params,
 	})
 }
 
@@ -241,15 +238,15 @@ func (s *Server) handleWMS(w http.ResponseWriter, r *http.Request) {
 		lines = append(lines, "time: "+timeValue)
 	}
 	lines = append(lines, extras(params, wmsCoreParameters)...)
-	s.writePNG(w, r, debugrender.Spec{Width: width, Height: height, Lines: lines})
+	background, textColor := imageColors(params)
+	s.writePNG(w, r, debugrender.Spec{Width: width, Height: height, Lines: lines, Background: background, TextColor: textColor})
 }
 
 type tileRequest struct {
 	Scheme            store.Scheme
-	Layer, Style      string
 	Zoom, Column, Row string
 	Time              string
-	Extras            []string
+	Params            map[string][]string
 }
 
 func (s *Server) serveTile(w http.ResponseWriter, r *http.Request, request tileRequest) {
@@ -268,21 +265,67 @@ func (s *Server) serveTile(w http.ResponseWriter, r *http.Request, request tileR
 		s.writeError(w, r, http.StatusBadRequest, "TileOutOfRange", fmt.Sprintf("tile row must be between 0 and %d", level.MatrixHeight-1))
 		return
 	}
-	bounds := request.Scheme.TileBounds(level, column, row)
+	lines := tileLines(level.Identifier, column, row, request.Time)
+	background, textColor := imageColors(request.Params)
+	s.writePNG(w, r, debugrender.Spec{
+		Width: request.Scheme.TileWidth, Height: request.Scheme.TileHeight, Lines: lines,
+		Background: background, TextColor: textColor,
+	})
+}
+
+func tileLines(zoom string, column, row int64, timeValue string) []string {
 	lines := []string{
-		"layer: " + request.Layer,
-		"scheme: " + request.Scheme.ID,
-		"crs: " + request.Scheme.CRS,
-		fmt.Sprintf("z/x/y: %s/%d/%d", level.Identifier, column, row),
-		fmt.Sprintf("size: %dx%d", request.Scheme.TileWidth, request.Scheme.TileHeight),
-		fmt.Sprintf("min: %.6f, %.6f", bounds.MinX, bounds.MinY),
-		fmt.Sprintf("max: %.6f, %.6f", bounds.MaxX, bounds.MaxY),
+		"z: " + zoom,
+		fmt.Sprintf("x: %d", column),
+		fmt.Sprintf("y: %d", row),
 	}
-	if request.Time != "" {
-		lines = append(lines, "time: "+request.Time)
+	if timeValue != "" {
+		lines = append(lines, "time: "+timeValue)
 	}
-	lines = append(lines, request.Extras...)
-	s.writePNG(w, r, debugrender.Spec{Width: request.Scheme.TileWidth, Height: request.Scheme.TileHeight, Lines: lines})
+	return lines
+}
+
+func imageColors(params map[string][]string) (color.Color, color.Color) {
+	var background color.Color
+	if strings.EqualFold(first(params, "TRANSPARENT", "true"), "false") {
+		background = parseHexColor(first(params, "BGCOLOR", ""), color.RGBA{A: 128})
+	}
+	var textColor color.Color
+	if value := first(params, "COLOR", ""); value != "" {
+		parsed := parseHexColor(value, color.RGBA{R: 255, G: 255, B: 0, A: 255})
+		textColor = parsed
+	}
+	return background, textColor
+}
+
+func parseHexColor(value string, fallback color.RGBA) color.RGBA {
+	if len(value) != 3 && len(value) != 4 && len(value) != 6 && len(value) != 8 {
+		return fallback
+	}
+	number, err := strconv.ParseUint(value, 16, len(value)*4)
+	if err != nil {
+		return fallback
+	}
+	switch len(value) {
+	case 3:
+		return color.RGBA{
+			R: uint8(number>>8) * 17,
+			G: uint8(number>>4&0xf) * 17,
+			B: uint8(number&0xf) * 17,
+			A: 255,
+		}
+	case 4:
+		return color.RGBA{
+			R: uint8(number>>12) * 17,
+			G: uint8(number>>8&0xf) * 17,
+			B: uint8(number>>4&0xf) * 17,
+			A: uint8(number&0xf) * 17,
+		}
+	case 6:
+		return color.RGBA{R: uint8(number >> 16), G: uint8(number >> 8), B: uint8(number), A: 255}
+	default:
+		return color.RGBA{R: uint8(number >> 24), G: uint8(number >> 16), B: uint8(number >> 8), A: uint8(number)}
+	}
 }
 
 func (s *Server) resolveScheme(ctx context.Context, id string) (store.Scheme, error) {
@@ -426,14 +469,9 @@ func defaultBBOX(crs, version string) string {
 	return "-180,-90,180,90"
 }
 
-var wmtsCoreParameters = map[string]bool{
-	"SERVICE": true, "REQUEST": true, "VERSION": true, "LAYER": true,
-	"STYLE": true, "FORMAT": true, "TILEMATRIXSET": true, "TILEMATRIX": true,
-	"TILEROW": true, "TILECOL": true, "TIME": true,
-}
-
 var wmsCoreParameters = map[string]bool{
 	"SERVICE": true, "REQUEST": true, "VERSION": true, "LAYERS": true,
 	"STYLES": true, "FORMAT": true, "TRANSPARENT": true, "CRS": true,
 	"SRS": true, "BBOX": true, "WIDTH": true, "HEIGHT": true, "TIME": true,
+	"BGCOLOR": true, "COLOR": true,
 }

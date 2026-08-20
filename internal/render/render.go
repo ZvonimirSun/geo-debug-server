@@ -26,9 +26,11 @@ var (
 )
 
 type Spec struct {
-	Width  int
-	Height int
-	Lines  []string
+	Width      int
+	Height     int
+	Lines      []string
+	Background color.Color
+	TextColor  color.Color
 }
 
 type layout struct {
@@ -52,6 +54,9 @@ func PNG(spec Spec) ([]byte, error) {
 	}
 
 	img := image.NewRGBA(image.Rect(0, 0, spec.Width, spec.Height))
+	if spec.Background != nil {
+		draw.Draw(img, img.Bounds(), image.NewUniform(spec.Background), image.Point{}, draw.Src)
+	}
 	drawBorder(img, 2, yellow)
 
 	availableWidth := max(1, spec.Width-16)
@@ -63,7 +68,11 @@ func PNG(spec Spec) ([]byte, error) {
 	defer result.face.Close()
 
 	startY := (spec.Height-result.height)/2 + result.ascent
-	drawer := &font.Drawer{Dst: img, Src: image.NewUniform(yellow), Face: result.face}
+	textColor := spec.TextColor
+	if textColor == nil {
+		textColor = yellow
+	}
+	drawer := &font.Drawer{Dst: img, Src: image.NewUniform(textColor), Face: result.face}
 	for index, line := range result.lines {
 		advance := drawer.MeasureString(line).Ceil()
 		x := (spec.Width - advance) / 2
@@ -90,7 +99,7 @@ func monoFont() (*opentype.Font, error) {
 }
 
 func fitLayout(ttf *opentype.Font, source []string, width, height int) (layout, error) {
-	startSize := math.Min(18, math.Max(4, float64(height)/3))
+	startSize := math.Min(32, math.Max(4, float64(height)/3))
 	for size := startSize; size >= 1; size -= 0.5 {
 		candidate, err := makeLayout(ttf, source, width, size)
 		if err != nil {

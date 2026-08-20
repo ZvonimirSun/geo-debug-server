@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"image/color"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
@@ -55,6 +56,79 @@ func TestXYZForLeaflet(t *testing.T) {
 	outOfRange := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/WorldCRS84Quad/0/2/0.png")
 	if outOfRange.Code != http.StatusBadRequest {
 		t.Fatalf("expected out-of-range status 400, got %d", outOfRange.Code)
+	}
+}
+
+func TestTileLinesOnlyContainCoordinatesAndOptionalTime(t *testing.T) {
+	withoutTime := tileLines("3", 4, 2, "")
+	if actual := strings.Join(withoutTime, "|"); actual != "z: 3|x: 4|y: 2" {
+		t.Fatalf("unexpected default tile lines: %q", actual)
+	}
+	withTime := tileLines("3", 4, 2, "step-1")
+	if actual := strings.Join(withTime, "|"); actual != "z: 3|x: 4|y: 2|time: step-1" {
+		t.Fatalf("unexpected timed tile lines: %q", actual)
+	}
+}
+
+func TestTileRenderColors(t *testing.T) {
+	handler := testHandler(t)
+
+	transparent := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/0/0/0.png")
+	transparentImage, err := png.Decode(bytes.NewReader(transparent.Body.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, alpha := transparentImage.At(3, 3).RGBA(); alpha != 0 {
+		t.Fatalf("default tile background is not transparent: alpha=%x", alpha)
+	}
+
+	fallback := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/0/0/0.png?transparent=false")
+	fallbackImage, err := png.Decode(bytes.NewReader(fallback.Body.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual := color.RGBAModel.Convert(fallbackImage.At(3, 3)).(color.RGBA); actual != (color.RGBA{A: 0x80}) {
+		t.Fatalf("unexpected fallback background: %#v", actual)
+	}
+
+	custom := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/0/0/0.png?TrAnSpArEnT=FALSE&BgCoLoR=123456&CoLoR=00FF00")
+	customImage, err := png.Decode(bytes.NewReader(custom.Body.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual := color.RGBAModel.Convert(customImage.At(3, 3)).(color.RGBA); actual != (color.RGBA{R: 0x12, G: 0x34, B: 0x56, A: 0xff}) {
+		t.Fatalf("unexpected custom background: %#v", actual)
+	}
+	greenPixels := 0
+	for y := 2; y < customImage.Bounds().Dy()-2; y++ {
+		for x := 2; x < customImage.Bounds().Dx()-2; x++ {
+			pixel := color.RGBAModel.Convert(customImage.At(x, y)).(color.RGBA)
+			if pixel.G > pixel.R && pixel.G > pixel.B {
+				greenPixels++
+			}
+		}
+	}
+	if greenPixels == 0 {
+		t.Fatal("tile contains no custom-colored text")
+	}
+}
+
+func TestParseHexColorFormats(t *testing.T) {
+	fallback := color.RGBA{R: 1, G: 2, B: 3, A: 4}
+	tests := map[string]color.RGBA{
+		"abc":      {R: 0xaa, G: 0xbb, B: 0xcc, A: 0xff},
+		"abc8":     {R: 0xaa, G: 0xbb, B: 0xcc, A: 0x88},
+		"123456":   {R: 0x12, G: 0x34, B: 0x56, A: 0xff},
+		"12345678": {R: 0x12, G: 0x34, B: 0x56, A: 0x78},
+		"invalid":  fallback,
+		"#fff":     fallback,
+	}
+	for value, expected := range tests {
+		t.Run(value, func(t *testing.T) {
+			if actual := parseHexColor(value, fallback); actual != expected {
+				t.Fatalf("parseHexColor(%q) = %#v, want %#v", value, actual, expected)
+			}
+		})
 	}
 }
 

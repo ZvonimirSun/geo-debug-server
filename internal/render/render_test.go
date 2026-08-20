@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"image/color"
 	"image/png"
 	"strings"
 	"testing"
@@ -36,6 +37,36 @@ func TestPNGIsDeterministicAndDrawsBorder(t *testing.T) {
 	_, _, _, centerAlpha := img.At(128, 128).RGBA()
 	if centerAlpha != 0 && centerAlpha != 0xffff {
 		t.Fatalf("unexpected alpha at center: %x", centerAlpha)
+	}
+}
+
+func TestPNGUsesBackgroundAndTextColors(t *testing.T) {
+	data, err := PNG(Spec{
+		Width: 256, Height: 256, Lines: []string{"color"},
+		Background: color.RGBA{R: 0x12, G: 0x34, B: 0x56, A: 0xff},
+		TextColor:  color.RGBA{R: 0, G: 0xff, B: 0, A: 0xff},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual := color.RGBAModel.Convert(img.At(3, 3)).(color.RGBA); actual != (color.RGBA{R: 0x12, G: 0x34, B: 0x56, A: 0xff}) {
+		t.Fatalf("unexpected background color: %#v", actual)
+	}
+	greenPixels := 0
+	for y := 2; y < 254; y++ {
+		for x := 2; x < 254; x++ {
+			pixel := color.RGBAModel.Convert(img.At(x, y)).(color.RGBA)
+			if pixel.G > pixel.R && pixel.G > pixel.B {
+				greenPixels++
+			}
+		}
+	}
+	if greenPixels == 0 {
+		t.Fatal("rendered image has no custom-colored text pixels")
 	}
 }
 
