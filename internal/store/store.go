@@ -32,6 +32,7 @@ type Scheme struct {
 	ID               string
 	Name             string
 	CRS              string
+	MetersPerUnit    float64
 	TileWidth        int
 	TileHeight       int
 	MinZoom          int
@@ -48,12 +49,11 @@ type Scheme struct {
 }
 
 type MatrixLevel struct {
-	Zoom             int
-	Identifier       string
-	Resolution       float64
-	ScaleDenominator float64
-	MatrixWidth      int64
-	MatrixHeight     int64
+	Zoom         int
+	Identifier   string
+	Resolution   float64
+	MatrixWidth  int64
+	MatrixHeight int64
 }
 
 type Bounds struct {
@@ -147,19 +147,6 @@ func (s *Store) init(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("create database schema: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(1, ?)`,
-		time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-		return fmt.Errorf("record schema version: %w", err)
-	}
-	if err := migrateYCoordinateFirst(ctx, tx); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(2, ?)`,
-		time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-		return fmt.Errorf("record schema version: %w", err)
-	}
 	for _, scheme := range defaultSchemes() {
 		if err := seedScheme(ctx, tx, scheme); err != nil {
 			return err
@@ -171,50 +158,14 @@ func (s *Store) init(ctx context.Context) error {
 	return nil
 }
 
-func migrateYCoordinateFirst(ctx context.Context, tx *sql.Tx) error {
-	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(tile_schemes)`)
-	if err != nil {
-		return fmt.Errorf("inspect tile scheme columns: %w", err)
-	}
-	found := false
-	for rows.Next() {
-		var cid, notNull, primaryKey int
-		var name, columnType string
-		var defaultValue sql.NullString
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan tile scheme column: %w", err)
-		}
-		if strings.EqualFold(name, "y_coordinate_first") {
-			found = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("iterate tile scheme columns: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close tile scheme columns: %w", err)
-	}
-	if found {
-		return nil
-	}
-	if _, err := tx.ExecContext(ctx, `
-		ALTER TABLE tile_schemes ADD COLUMN y_coordinate_first INTEGER NOT NULL DEFAULT 0
-		CHECK(y_coordinate_first IN (0, 1))`); err != nil {
-		return fmt.Errorf("add tile scheme axis order: %w", err)
-	}
-	return nil
-}
-
 func seedScheme(ctx context.Context, tx *sql.Tx, scheme Scheme) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO tile_schemes(
-			id, name, crs, tile_width, tile_height, min_zoom, max_zoom,
+			id, name, crs, meters_per_unit, tile_width, tile_height, min_zoom, max_zoom,
 			origin_x, origin_y, min_x, min_y, max_x, max_y, y_coordinate_first, is_default
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING`,
-		scheme.ID, scheme.Name, scheme.CRS, scheme.TileWidth, scheme.TileHeight,
+		scheme.ID, scheme.Name, scheme.CRS, scheme.MetersPerUnit, scheme.TileWidth, scheme.TileHeight,
 		scheme.MinZoom, scheme.MaxZoom, scheme.OriginX, scheme.OriginY,
 		scheme.MinX, scheme.MinY, scheme.MaxX, scheme.MaxY, scheme.YCoordinateFirst, scheme.IsDefault)
 	if err != nil {
@@ -223,11 +174,11 @@ func seedScheme(ctx context.Context, tx *sql.Tx, scheme Scheme) error {
 	for _, level := range scheme.Levels {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO tile_matrix_levels(
-				scheme_id, zoom, identifier, resolution, scale_denominator, matrix_width, matrix_height
-			) VALUES(?, ?, ?, ?, ?, ?, ?)
+				scheme_id, zoom, identifier, resolution, matrix_width, matrix_height
+			) VALUES(?, ?, ?, ?, ?, ?)
 			ON CONFLICT DO NOTHING`,
 			scheme.ID, level.Zoom, level.Identifier, level.Resolution,
-			level.ScaleDenominator, level.MatrixWidth, level.MatrixHeight); err != nil {
+			level.MatrixWidth, level.MatrixHeight); err != nil {
 			return fmt.Errorf("seed tile matrix %s/%d: %w", scheme.ID, level.Zoom, err)
 		}
 	}
@@ -261,12 +212,12 @@ func (s *Store) Scheme(ctx context.Context, id string) (Scheme, error) {
 
 func (s *Store) loadScheme(ctx context.Context, id string) (Scheme, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, crs, tile_width, tile_height, min_zoom, max_zoom,
+		SELECT id, name, crs, meters_per_unit, tile_width, tile_height, min_zoom, max_zoom,
 		       origin_x, origin_y, min_x, min_y, max_x, max_y, y_coordinate_first, is_default
 		FROM tile_schemes WHERE lower(id) = lower(?)`, id)
 	var scheme Scheme
 	if err := row.Scan(
-		&scheme.ID, &scheme.Name, &scheme.CRS, &scheme.TileWidth, &scheme.TileHeight,
+		&scheme.ID, &scheme.Name, &scheme.CRS, &scheme.MetersPerUnit, &scheme.TileWidth, &scheme.TileHeight,
 		&scheme.MinZoom, &scheme.MaxZoom, &scheme.OriginX, &scheme.OriginY,
 		&scheme.MinX, &scheme.MinY, &scheme.MaxX, &scheme.MaxY,
 		&scheme.YCoordinateFirst, &scheme.IsDefault,
@@ -365,7 +316,7 @@ func (s *Store) Schemes(ctx context.Context) ([]Scheme, error) {
 
 func (s *Store) levels(ctx context.Context, schemeID string) ([]MatrixLevel, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT zoom, identifier, resolution, scale_denominator, matrix_width, matrix_height
+		SELECT zoom, identifier, resolution, matrix_width, matrix_height
 		FROM tile_matrix_levels WHERE scheme_id = ? ORDER BY zoom`, schemeID)
 	if err != nil {
 		return nil, fmt.Errorf("query tile matrix levels: %w", err)
@@ -375,7 +326,7 @@ func (s *Store) levels(ctx context.Context, schemeID string) ([]MatrixLevel, err
 	for rows.Next() {
 		var level MatrixLevel
 		if err := rows.Scan(&level.Zoom, &level.Identifier, &level.Resolution,
-			&level.ScaleDenominator, &level.MatrixWidth, &level.MatrixHeight); err != nil {
+			&level.MatrixWidth, &level.MatrixHeight); err != nil {
 			return nil, fmt.Errorf("scan tile matrix level: %w", err)
 		}
 		levels = append(levels, level)
@@ -492,22 +443,28 @@ func (s Scheme) TileBounds(level MatrixLevel, column, row int64) Bounds {
 }
 
 func defaultSchemes() []Scheme {
-	const mercatorHalfWorld = 20037508.342789244
+	const (
+		mercatorHalfWorld = 20037508.342789244
+		metersPerDegree   = 111319.49079327358
+	)
 	mercator := Scheme{
 		ID: WebMercatorQuad, Name: "Web Mercator Quad", CRS: "EPSG:3857",
-		TileWidth: 256, TileHeight: 256, MinZoom: 0, MaxZoom: 22,
+		MetersPerUnit: 1,
+		TileWidth:     256, TileHeight: 256, MinZoom: 0, MaxZoom: 22,
 		OriginX: -mercatorHalfWorld, OriginY: mercatorHalfWorld,
 		MinX: -mercatorHalfWorld, MinY: -mercatorHalfWorld,
 		MaxX: mercatorHalfWorld, MaxY: mercatorHalfWorld, IsDefault: true,
 	}
 	crs84 := Scheme{
 		ID: WorldCRS84Quad, Name: "World CRS84 Quad", CRS: "CRS:84",
-		TileWidth: 256, TileHeight: 256, MinZoom: 0, MaxZoom: 22,
+		MetersPerUnit: metersPerDegree,
+		TileWidth:     256, TileHeight: 256, MinZoom: 0, MaxZoom: 23,
 		OriginX: -180, OriginY: 90, MinX: -180, MinY: -90, MaxX: 180, MaxY: 90,
 	}
 	cgcs2000 := Scheme{
 		ID: CGCS2000Quad, Name: "CGCS2000 Quad", CRS: "EPSG:4490",
-		TileWidth: 256, TileHeight: 256, MinZoom: 0, MaxZoom: 22,
+		MetersPerUnit: metersPerDegree,
+		TileWidth:     256, TileHeight: 256, MinZoom: 0, MaxZoom: 23,
 		OriginX: -180, OriginY: 90, MinX: -180, MinY: -90, MaxX: 180, MaxY: 90,
 		YCoordinateFirst: true,
 	}
@@ -515,36 +472,33 @@ func defaultSchemes() []Scheme {
 		factor := math.Exp2(float64(zoom))
 		mercator.Levels = append(mercator.Levels, MatrixLevel{
 			Zoom: zoom, Identifier: fmt.Sprint(zoom),
-			Resolution:       156543.03392804097 / factor,
-			ScaleDenominator: 559082264.0287178 / factor,
-			MatrixWidth:      int64(factor), MatrixHeight: int64(factor),
+			Resolution:  156543.03392804097 / factor,
+			MatrixWidth: int64(factor), MatrixHeight: int64(factor),
 		})
-		crs84.Levels = append(crs84.Levels, MatrixLevel{
+	}
+	for zoom := 0; zoom <= 23; zoom++ {
+		factor := math.Exp2(float64(zoom))
+		matrixHeight := int64(1)
+		if zoom > 0 {
+			matrixHeight = int64(factor / 2)
+		}
+		level := MatrixLevel{
 			Zoom: zoom, Identifier: fmt.Sprint(zoom),
-			Resolution:       0.703125 / factor,
-			ScaleDenominator: 279541132.0143589 / factor,
-			MatrixWidth:      int64(2 * factor), MatrixHeight: int64(factor),
-		})
-		cgcs2000.Levels = append(cgcs2000.Levels, MatrixLevel{
-			Zoom: zoom, Identifier: fmt.Sprint(zoom),
-			Resolution:       0.703125 / factor,
-			ScaleDenominator: 279541132.0143589 / factor,
-			MatrixWidth:      int64(2 * factor), MatrixHeight: int64(factor),
-		})
+			Resolution:  1.40625 / factor,
+			MatrixWidth: int64(factor), MatrixHeight: matrixHeight,
+		}
+		crs84.Levels = append(crs84.Levels, level)
+		cgcs2000.Levels = append(cgcs2000.Levels, level)
 	}
 	return []Scheme{mercator, crs84, cgcs2000}
 }
 
 const schemaSQL = `
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER PRIMARY KEY,
-    applied_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS tile_schemes (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    crs TEXT NOT NULL,
+	    id TEXT PRIMARY KEY,
+	    name TEXT NOT NULL,
+	    crs TEXT NOT NULL,
+	    meters_per_unit REAL NOT NULL CHECK(meters_per_unit > 0),
     tile_width INTEGER NOT NULL CHECK(tile_width > 0),
     tile_height INTEGER NOT NULL CHECK(tile_height > 0),
     min_zoom INTEGER NOT NULL,
@@ -561,10 +515,9 @@ CREATE TABLE IF NOT EXISTS tile_schemes (
 
 CREATE TABLE IF NOT EXISTS tile_matrix_levels (
     scheme_id TEXT NOT NULL REFERENCES tile_schemes(id) ON DELETE CASCADE,
-    zoom INTEGER NOT NULL,
-    identifier TEXT NOT NULL,
-    resolution REAL NOT NULL CHECK(resolution > 0),
-    scale_denominator REAL NOT NULL CHECK(scale_denominator > 0),
+	    zoom INTEGER NOT NULL,
+	    identifier TEXT NOT NULL,
+	    resolution REAL NOT NULL CHECK(resolution > 0),
     matrix_width INTEGER NOT NULL CHECK(matrix_width > 0),
     matrix_height INTEGER NOT NULL CHECK(matrix_height > 0),
     PRIMARY KEY(scheme_id, zoom),

@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"math"
 	"path/filepath"
@@ -49,10 +48,15 @@ func TestDefaultSchemesAndBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 	crsLevel0, ok := crs84.Level("0")
-	if !ok || crs84.YCoordinateFirst || crsLevel0.MatrixWidth != 2 || crsLevel0.MatrixHeight != 1 {
+	if !ok || crs84.YCoordinateFirst || len(crs84.Levels) != 24 || crsLevel0.Resolution != 1.40625 ||
+		crsLevel0.MatrixWidth != 1 || crsLevel0.MatrixHeight != 1 {
 		t.Fatalf("unexpected WorldCRS84Quad level 0: %+v", crsLevel0)
 	}
-	rightHalf := crs84.TileBounds(crsLevel0, 1, 0)
+	crsLevel1, ok := crs84.Level("1")
+	if !ok || crsLevel1.Resolution != 0.703125 || crsLevel1.MatrixWidth != 2 || crsLevel1.MatrixHeight != 1 {
+		t.Fatalf("unexpected WorldCRS84Quad level 1: %+v", crsLevel1)
+	}
+	rightHalf := crs84.TileBounds(crsLevel1, 1, 0)
 	if rightHalf.MinX != 0 || rightHalf.MaxX != 180 || rightHalf.MinY != -90 || rightHalf.MaxY != 90 {
 		t.Fatalf("unexpected CRS84 right-half bounds: %+v", rightHalf)
 	}
@@ -62,11 +66,15 @@ func TestDefaultSchemesAndBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 	cgcsLevel0, ok := cgcs2000.Level("0")
-	if !ok || cgcs2000.CRS != "EPSG:4490" || !cgcs2000.YCoordinateFirst || len(cgcs2000.Levels) != 23 ||
-		cgcsLevel0.MatrixWidth != 2 || cgcsLevel0.MatrixHeight != 1 {
+	if !ok || cgcs2000.CRS != "EPSG:4490" || !cgcs2000.YCoordinateFirst || len(cgcs2000.Levels) != 24 ||
+		cgcsLevel0.Resolution != 1.40625 || cgcsLevel0.MatrixWidth != 1 || cgcsLevel0.MatrixHeight != 1 {
 		t.Fatalf("unexpected CGCS2000Quad level 0: scheme=%+v level=%+v", cgcs2000, cgcsLevel0)
 	}
-	cgcsRightHalf := cgcs2000.TileBounds(cgcsLevel0, 1, 0)
+	cgcsLevel1, ok := cgcs2000.Level("1")
+	if !ok {
+		t.Fatal("missing CGCS2000Quad level 1")
+	}
+	cgcsRightHalf := cgcs2000.TileBounds(cgcsLevel1, 1, 0)
 	if cgcsRightHalf.MinX != 0 || cgcsRightHalf.MaxX != 180 || cgcsRightHalf.MinY != -90 || cgcsRightHalf.MaxY != 90 {
 		t.Fatalf("unexpected CGCS2000 right-half bounds: %+v", cgcsRightHalf)
 	}
@@ -107,66 +115,6 @@ func TestInitializationDoesNotOverwriteExistingScheme(t *testing.T) {
 	}
 	if !added.YCoordinateFirst {
 		t.Fatal("initialization did not preserve the CGCS2000 axis order")
-	}
-}
-
-func TestMigratesAndLoadsYCoordinateFirst(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "legacy.db")
-	legacySchema := strings.Replace(schemaSQL,
-		"    y_coordinate_first INTEGER NOT NULL DEFAULT 0 CHECK(y_coordinate_first IN (0, 1)),\n", "", 1)
-	if legacySchema == schemaSQL {
-		t.Fatal("failed to construct legacy schema")
-	}
-	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := raw.ExecContext(ctx, legacySchema); err != nil {
-		raw.Close()
-		t.Fatal(err)
-	}
-	if _, err := raw.ExecContext(ctx,
-		`INSERT INTO schema_version(version, applied_at) VALUES(1, 'legacy')`); err != nil {
-		raw.Close()
-		t.Fatal(err)
-	}
-	if _, err := raw.ExecContext(ctx, `
-		INSERT INTO tile_schemes(
-			id, name, crs, tile_width, tile_height, min_zoom, max_zoom,
-			origin_x, origin_y, min_x, min_y, max_x, max_y, is_default
-		) VALUES('LegacyQuad', 'Legacy Quad', 'EPSG:4326', 256, 256, 0, 0,
-			-180, 90, -180, -90, 180, 90, 0)`); err != nil {
-		raw.Close()
-		t.Fatal(err)
-	}
-	if err := raw.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	database, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
-	var version2 int
-	if err := database.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM schema_version WHERE version = 2`).Scan(&version2); err != nil {
-		t.Fatal(err)
-	}
-	if version2 != 1 {
-		t.Fatalf("expected schema version 2, got count %d", version2)
-	}
-	if _, err := database.db.ExecContext(ctx,
-		`UPDATE tile_schemes SET y_coordinate_first = 1 WHERE id = 'LegacyQuad'`); err != nil {
-		t.Fatal(err)
-	}
-	legacy, err := database.Scheme(ctx, "LegacyQuad")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !legacy.YCoordinateFirst {
-		t.Fatal("scheme did not load configured y_coordinate_first")
 	}
 }
 

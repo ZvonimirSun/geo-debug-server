@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"image/color"
 	"image/png"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -49,11 +50,11 @@ func TestXYZForLeaflet(t *testing.T) {
 		t.Fatal("CORS does not expose arbitrary response headers")
 	}
 
-	crs84 := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/WorldCRS84Quad/0/1/0.png")
+	crs84 := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/WorldCRS84Quad/1/1/0.png")
 	assertPNG(t, crs84, 256, 256)
-	cgcs2000 := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/CGCS2000Quad/0/1/0.png")
+	cgcs2000 := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/CGCS2000Quad/1/1/0.png")
 	assertPNG(t, cgcs2000, 256, 256)
-	outOfRange := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/WorldCRS84Quad/0/2/0.png")
+	outOfRange := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/WorldCRS84Quad/0/1/0.png")
 	if outOfRange.Code != http.StatusBadRequest {
 		t.Fatalf("expected out-of-range status 400, got %d", outOfRange.Code)
 	}
@@ -147,7 +148,7 @@ func TestWMTSRESTPaths(t *testing.T) {
 	handler := testHandler(t)
 	paths := []string{
 		"/geo-debug-server/wmts/3/2/4.png",
-		"/geo-debug-server/wmts/WorldCRS84Quad/0/0/1.png",
+		"/geo-debug-server/wmts/WorldCRS84Quad/1/0/1.png",
 		"/geo-debug-server/wmts/debug/default/WebMercatorQuad/3/2/4.png",
 	}
 	for _, path := range paths {
@@ -244,7 +245,7 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 	for _, expected := range []string{
 		`xmlns="http://www.opengis.net/wmts/1.0"`, `xmlns:ows="http://www.opengis.net/ows/1.1"`,
 		"<Contents>", "<ows:Identifier>", "WebMercatorQuad", "WorldCRS84Quad", "CGCS2000Quad", "ResourceURL",
-		"http://maps.example.test/geo-debug-server/wmts",
+		"<ows:AnyValue></ows:AnyValue>", "http://maps.example.test/geo-debug-server/wmts",
 	} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("WMTS metadata does not contain %q", expected)
@@ -278,6 +279,9 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 		case "GetCapabilities":
 			if strings.Join(parameters["AcceptVersions"], ",") != "1.0.0" || strings.Join(parameters["AcceptFormats"], ",") != "application/xml" {
 				t.Fatalf("incomplete GetCapabilities parameters: %+v", parameters)
+			}
+			if _, ok := parameters["DPI"]; !ok {
+				t.Fatalf("GetCapabilities does not advertise the DPI extension: %+v", parameters)
 			}
 		case "GetTile":
 			if strings.Join(parameters["Layer"], ",") != "debug" || strings.Join(parameters["Style"], ",") != "default" ||
@@ -316,8 +320,14 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 		"WorldCRS84Quad":  "-180 90",
 		"CGCS2000Quad":    "90 -180",
 	}
+	expectedMatrixCount := map[string]int{
+		"WebMercatorQuad": 23,
+		"WorldCRS84Quad":  24,
+		"CGCS2000Quad":    24,
+	}
+	var level0Scale float64
 	for _, matrixSet := range wmtsDocument.Contents.MatrixSets {
-		if len(matrixSet.Matrices) != 23 || matrixSet.Matrices[0].Identifier != "0" ||
+		if len(matrixSet.Matrices) != expectedMatrixCount[matrixSet.Identifier] || matrixSet.Matrices[0].Identifier != "0" ||
 			matrixSet.Matrices[0].ScaleDenominator <= 0 || matrixSet.Matrices[0].TopLeftCorner == "" ||
 			matrixSet.Matrices[0].TileWidth != 256 || matrixSet.Matrices[0].MatrixWidth <= 0 {
 			t.Fatalf("unexpected tile matrix set: %+v", matrixSet)
@@ -327,6 +337,12 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 		}
 		if matrixSet.Matrices[0].TopLeftCorner != expectedTopLeft[matrixSet.Identifier] {
 			t.Fatalf("unexpected top-left corner for %s: %q", matrixSet.Identifier, matrixSet.Matrices[0].TopLeftCorner)
+		}
+		if level0Scale == 0 {
+			level0Scale = matrixSet.Matrices[0].ScaleDenominator
+		} else if math.Abs(matrixSet.Matrices[0].ScaleDenominator-level0Scale) > level0Scale*1e-12 {
+			t.Fatalf("level 0 scale is not aligned for %s: got %.12f want %.12f",
+				matrixSet.Identifier, matrixSet.Matrices[0].ScaleDenominator, level0Scale)
 		}
 	}
 	if len(wmtsDocument.MetadataURLs) != 2 ||
@@ -344,6 +360,63 @@ func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
 	rest := perform(t, handler, http.MethodGet, "/geo-debug-server/wmts/1.0.0/WMTSCapabilities.xml")
 	if !bytes.Equal(wmts.Body.Bytes(), rest.Body.Bytes()) {
 		t.Fatal("REST WMTS capabilities request returned different metadata")
+	}
+}
+
+func TestWMTSMetadataDPI(t *testing.T) {
+	handler := testHandler(t)
+	defaultResponse := perform(t, handler, http.MethodGet, "/geo-debug-server/wmts")
+	customResponse := perform(t, handler, http.MethodGet, "/geo-debug-server/wmts?REQUEST=GetCapabilities&DPI=96")
+	assertXMLStatus(t, customResponse, http.StatusOK)
+
+	defaultScale := wmtsFirstScale(t, defaultResponse, store.WebMercatorQuad)
+	customScale := wmtsFirstScale(t, customResponse, store.WebMercatorQuad)
+	expectedScale := defaultScale * 96 / defaultWMTSDPI
+	if math.Abs(customScale-expectedScale) > expectedScale*1e-12 {
+		t.Fatalf("unexpected 96 DPI scale denominator: got %.12f want %.12f", customScale, expectedScale)
+	}
+	if !strings.Contains(customResponse.Body.String(), "DPI=96") {
+		t.Fatal("96 DPI capabilities does not preserve DPI in metadata URLs")
+	}
+
+	restResponse := perform(t, handler, http.MethodGet, "/geo-debug-server/wmts/1.0.0/WMTSCapabilities.xml?dpi=96")
+	if !bytes.Equal(customResponse.Body.Bytes(), restResponse.Body.Bytes()) {
+		t.Fatal("KVP and REST requests produced different 96 DPI capabilities")
+	}
+
+	invalid := perform(t, handler, http.MethodGet, "/geo-debug-server/wmts?REQUEST=GetCapabilities&DPI=invalid")
+	if invalid.Code != http.StatusBadRequest || !strings.Contains(invalid.Body.String(), "DPI") {
+		t.Fatalf("unexpected invalid DPI response: %d %s", invalid.Code, invalid.Body.String())
+	}
+}
+
+func wmtsFirstScale(t *testing.T, response *httptest.ResponseRecorder, matrixSetID string) float64 {
+	t.Helper()
+	assertXMLStatus(t, response, http.StatusOK)
+	var document struct {
+		MatrixSets []struct {
+			Identifier string `xml:"Identifier"`
+			Matrices   []struct {
+				ScaleDenominator float64 `xml:"ScaleDenominator"`
+			} `xml:"TileMatrix"`
+		} `xml:"Contents>TileMatrixSet"`
+	}
+	if err := xml.Unmarshal(response.Body.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	for _, matrixSet := range document.MatrixSets {
+		if matrixSet.Identifier == matrixSetID && len(matrixSet.Matrices) > 0 {
+			return matrixSet.Matrices[0].ScaleDenominator
+		}
+	}
+	t.Fatalf("matrix set %q has no scale denominator", matrixSetID)
+	return 0
+}
+
+func assertXMLStatus(t *testing.T, response *httptest.ResponseRecorder, status int) {
+	t.Helper()
+	if response.Code != status {
+		t.Fatalf("expected status %d, got %d: %s", status, response.Code, response.Body.String())
 	}
 }
 

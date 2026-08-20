@@ -3,7 +3,9 @@ package server
 import (
 	"encoding/xml"
 	"fmt"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -12,6 +14,7 @@ const (
 	owsNamespace   = "http://www.opengis.net/ows/1.1"
 	xlinkNamespace = "http://www.w3.org/1999/xlink"
 	wmsNamespace   = "http://www.opengis.net/wms"
+	defaultWMTSDPI = 25.4 / 0.28
 )
 
 type wmtsCapabilities struct {
@@ -65,8 +68,9 @@ type owsAllowedValues struct {
 }
 
 type owsParameter struct {
-	Name          string           `xml:"name,attr"`
-	AllowedValues owsAllowedValues `xml:"ows:AllowedValues"`
+	Name          string            `xml:"name,attr"`
+	AllowedValues *owsAllowedValues `xml:"ows:AllowedValues,omitempty"`
+	AnyValue      *struct{}         `xml:"ows:AnyValue,omitempty"`
 }
 
 type wmtsContents struct {
@@ -268,6 +272,11 @@ type wmsStyle struct {
 }
 
 func (s *Server) writeWMTSMetadata(w http.ResponseWriter, r *http.Request) {
+	dpi, err := wmtsDPI(r)
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "InvalidParameterValue", err.Error())
+		return
+	}
 	schemes, err := s.store.Schemes(r.Context())
 	if err != nil {
 		s.writeStoreError(w, r, err)
@@ -275,6 +284,13 @@ func (s *Server) writeWMTSMetadata(w http.ResponseWriter, r *http.Request) {
 	}
 	root := s.publicRoot(r)
 	endpoint := root + "/wmts"
+	dpiValue := strconv.FormatFloat(dpi, 'g', -1, 64)
+	metadataKVPURL := endpoint + "?SERVICE=WMTS&REQUEST=GetCapabilities&VERSION=1.0.0"
+	metadataRESTURL := endpoint + "/1.0.0/WMTSCapabilities.xml"
+	if dpi != defaultWMTSDPI {
+		metadataKVPURL += "&DPI=" + dpiValue
+		metadataRESTURL += "?DPI=" + dpiValue
+	}
 	matrixSetIDs := make([]string, 0, len(schemes))
 	for _, scheme := range schemes {
 		matrixSetIDs = append(matrixSetIDs, scheme.ID)
@@ -287,7 +303,8 @@ func (s *Server) writeWMTSMetadata(w http.ResponseWriter, r *http.Request) {
 		OperationsMetadata: owsOperationsMetadata{Operations: []owsOperation{
 			wmtsOperation("GetCapabilities", endpoint,
 				owsParameterValues("AcceptVersions", "1.0.0"),
-				owsParameterValues("AcceptFormats", "application/xml")),
+				owsParameterValues("AcceptFormats", "application/xml"),
+				owsAnyParameter("DPI")),
 			wmtsOperation("GetTile", endpoint,
 				owsParameterValues("Layer", "debug"),
 				owsParameterValues("Style", "default"),
@@ -307,8 +324,8 @@ func (s *Server) writeWMTSMetadata(w http.ResponseWriter, r *http.Request) {
 			}},
 		}},
 		ServiceMetadataURLs: []wmtsServiceMetadataURL{
-			{Href: endpoint + "?SERVICE=WMTS&REQUEST=GetCapabilities&VERSION=1.0.0"},
-			{Href: endpoint + "/1.0.0/WMTSCapabilities.xml"},
+			{Href: metadataKVPURL},
+			{Href: metadataRESTURL},
 		},
 	}
 	for _, scheme := range schemes {
@@ -323,7 +340,7 @@ func (s *Server) writeWMTSMetadata(w http.ResponseWriter, r *http.Request) {
 		matrixSet := wmtsTileMatrixSet{Title: scheme.Name, Identifier: scheme.ID, SupportedCRS: crs}
 		for _, level := range scheme.Levels {
 			matrixSet.Matrices = append(matrixSet.Matrices, wmtsTileMatrix{
-				Identifier: level.Identifier, ScaleDenominator: level.ScaleDenominator,
+				Identifier: level.Identifier, ScaleDenominator: scaleDenominator(level.Resolution, scheme.MetersPerUnit, dpi),
 				TopLeftCorner: wmtsCoordinatePair(scheme.YCoordinateFirst, scheme.OriginX, scheme.OriginY),
 				TileWidth:     scheme.TileWidth, TileHeight: scheme.TileHeight,
 				MatrixWidth: level.MatrixWidth, MatrixHeight: level.MatrixHeight,
@@ -340,6 +357,22 @@ func (s *Server) writeWMTSMetadata(w http.ResponseWriter, r *http.Request) {
 	writeResponse(w, r, http.StatusOK, "application/xml; charset=utf-8", data)
 }
 
+func scaleDenominator(resolution, metersPerUnit, dpi float64) float64 {
+	return resolution * metersPerUnit * dpi / 0.0254
+}
+
+func wmtsDPI(r *http.Request) (float64, error) {
+	value := first(normalizedQuery(r.URL.Query()), "DPI", "")
+	if value == "" {
+		return defaultWMTSDPI, nil
+	}
+	dpi, err := strconv.ParseFloat(value, 64)
+	if err != nil || dpi <= 0 || math.IsNaN(dpi) || math.IsInf(dpi, 0) {
+		return 0, fmt.Errorf("DPI must be a finite positive number")
+	}
+	return dpi, nil
+}
+
 func wmtsOperation(name, endpoint string, parameters ...owsParameter) owsOperation {
 	gets := make([]owsGet, 0, 2)
 	for _, encoding := range []string{"RESTFUL", "KVP"} {
@@ -353,7 +386,11 @@ func wmtsOperation(name, endpoint string, parameters ...owsParameter) owsOperati
 }
 
 func owsParameterValues(name string, values ...string) owsParameter {
-	return owsParameter{Name: name, AllowedValues: owsAllowedValues{Values: values}}
+	return owsParameter{Name: name, AllowedValues: &owsAllowedValues{Values: values}}
+}
+
+func owsAnyParameter(name string) owsParameter {
+	return owsParameter{Name: name, AnyValue: &struct{}{}}
 }
 
 func wmtsCRS(value string) string {
