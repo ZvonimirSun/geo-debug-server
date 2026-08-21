@@ -36,6 +36,68 @@ func perform(t *testing.T, handler http.Handler, method, target string) *httptes
 	return recorder
 }
 
+func TestServiceIndex(t *testing.T) {
+	handler := testHandler(t)
+	response := perform(t, handler, http.MethodGet, "/geo-debug-server/")
+	if response.Code != http.StatusOK {
+		t.Fatalf("unexpected service index status: %d %s", response.Code, response.Body.String())
+	}
+	if contentType := response.Header().Get("Content-Type"); contentType != "text/html; charset=utf-8" {
+		t.Fatalf("unexpected service index content type: %q", contentType)
+	}
+	if response.Header().Get("Cache-Control") != noStoreCache || response.Header().Get("Content-Security-Policy") == "" {
+		t.Fatalf("unexpected service index security or cache headers: %v", response.Header())
+	}
+	for _, expected := range []string{
+		"geo-debug-server", "XYZ", "WMTS", "WMS", "1.0.0", "1.3.0 / 1.1.1",
+		"http://maps.example.test/geo-debug-server/xyz/{z}/{x}/{y}.png",
+		"http://maps.example.test/geo-debug-server/wmts",
+		"http://maps.example.test/geo-debug-server/wms",
+	} {
+		if !strings.Contains(response.Body.String(), expected) {
+			t.Fatalf("service index does not contain %q", expected)
+		}
+	}
+
+	withoutSlash := perform(t, handler, http.MethodGet, "/geo-debug-server")
+	if withoutSlash.Code != http.StatusFound || withoutSlash.Header().Get("Location") != "/geo-debug-server/" {
+		t.Fatalf("unexpected base path redirect: status=%d location=%q", withoutSlash.Code, withoutSlash.Header().Get("Location"))
+	}
+	head := perform(t, handler, http.MethodHead, "/geo-debug-server/")
+	if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("Content-Length") == "" {
+		t.Fatalf("unexpected service index HEAD response: status=%d body=%d length=%q",
+			head.Code, head.Body.Len(), head.Header().Get("Content-Length"))
+	}
+}
+
+func TestServiceIndexUsesConfiguredBasePath(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "custom-base.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	handler := New(database, config.Config{BasePath: "/base-url"})
+	response := perform(t, handler, http.MethodGet, "/base-url/")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "http://maps.example.test/base-url/wmts") {
+		t.Fatalf("service index did not use configured base path: %d %s", response.Code, response.Body.String())
+	}
+	withoutSlash := perform(t, handler, http.MethodGet, "/base-url")
+	if withoutSlash.Code != http.StatusFound || withoutSlash.Header().Get("Location") != "/base-url/" {
+		t.Fatalf("unexpected configured base path redirect: status=%d location=%q", withoutSlash.Code, withoutSlash.Header().Get("Location"))
+	}
+	outsideBasePath := perform(t, handler, http.MethodGet, "/other/path")
+	if outsideBasePath.Code != http.StatusFound || outsideBasePath.Header().Get("Location") != "/base-url/" {
+		t.Fatalf("unexpected outside base path redirect: status=%d location=%q", outsideBasePath.Code, outsideBasePath.Header().Get("Location"))
+	}
+	if outsideBasePath.Header().Get("Cache-Control") != noStoreCache {
+		t.Fatalf("outside base path redirect must not be cached: %q", outsideBasePath.Header().Get("Cache-Control"))
+	}
+	unknownService := perform(t, handler, http.MethodGet, "/base-url/unknown")
+	if unknownService.Code != http.StatusNotFound {
+		t.Fatalf("unknown path within base path must return 404, got %d", unknownService.Code)
+	}
+}
+
 func TestXYZForLeaflet(t *testing.T) {
 	handler := testHandler(t)
 	response := perform(t, handler, http.MethodGet, "/geo-debug-server/xyz/2/1/1.png?time=demo")

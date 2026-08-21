@@ -48,10 +48,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	relative, ok := s.relativePath(r.URL.Path)
 	if !ok {
-		http.NotFound(w, r)
+		w.Header().Set("Cache-Control", noStoreCache)
+		http.Redirect(w, r, s.indexPath(), http.StatusFound)
 		return
 	}
 	switch {
+	case relative == "/":
+		s.writeIndex(w, r)
 	case relative == "/xyz" || strings.HasPrefix(relative, "/xyz/"):
 		s.handleXYZ(w, r, relative)
 	case relative == "/wmts" || strings.HasPrefix(relative, "/wmts/"):
@@ -63,12 +66,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) indexPath() string {
+	if s.basePath == "" {
+		return "/"
+	}
+	return s.basePath + "/"
+}
+
 func (s *Server) relativePath(path string) (string, bool) {
 	if s.basePath == "" {
 		return path, true
 	}
 	if path == s.basePath {
-		return "/", true
+		return "", false
 	}
 	if !strings.HasPrefix(path, s.basePath+"/") {
 		return "", false

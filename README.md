@@ -41,6 +41,7 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 
 | 方法 | 端点 | 功能 |
 | --- | --- | --- |
+| `GET` / `HEAD` | `/` | 返回当前服务支持的 XYZ、WMTS、WMS 地址说明页 |
 | `GET` / `HEAD` | `/xyz/{z}/{x}/{y}.png` | 使用默认切片方案生成 XYZ 调试瓦片 |
 | `GET` / `HEAD` | `/xyz/{scheme}/{z}/{x}/{y}.png` | 使用指定切片方案生成 XYZ 调试瓦片 |
 | `GET` / `HEAD` | `/wmts` | 返回 WMTS 1.0.0 Capabilities，包含操作、默认参数、图层、切片方案和 `ResourceURL` |
@@ -55,6 +56,8 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 | `OPTIONS` | 以上全部端点 | 返回跨域预检响应 |
 
 `GET` 返回响应正文；`HEAD` 返回相同响应头但不返回正文。修改 `-base-path` 或 `GEO_DEBUG_BASE_PATH` 后，使用配置后的基础路径替换上述默认前缀。
+
+服务说明页位于配置后的基础路径末尾 `/`。例如默认地址为 `/geo-debug-server/`；将基础路径配置为 `/base-url` 后，说明页地址为 `/base-url/`。基础路径之外的地址（包括不带末尾 `/` 的基础路径）会以 `302` 重定向到说明页；基础路径内未匹配服务端点的地址仍返回 `404`。
 
 XYZ 直接通过路径生成瓦片，不提供 Capabilities；WMTS 和 WMS 提供可由客户端解析的标准 Capabilities。
 
