@@ -40,6 +40,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	if r.URL.Path == superMapLicensePath {
+		s.writeSuperMapLicense(w, r)
+		return
+	}
 
 	relative, ok := s.relativePath(r.URL.Path)
 	if !ok {
@@ -69,6 +73,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleAGSTile(w, r, relative)
 	case relative == "/ags_rest" || strings.HasPrefix(relative, "/ags_rest/"):
 		s.handleAGSRest(w, r, relative)
+	case relative == "/spm_rest" || strings.HasPrefix(relative, "/spm_rest/"):
+		s.handleSuperMapREST(w, r, relative)
 	default:
 		http.NotFound(w, r)
 	}

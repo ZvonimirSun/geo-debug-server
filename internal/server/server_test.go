@@ -60,7 +60,7 @@ func TestServiceIndex(t *testing.T) {
 		t.Fatalf("unexpected service index security or cache headers: %v", response.Header())
 	}
 	for _, expected := range []string{
-		"geo-debug-server", "XYZ", "WMTS", "WMS", "ArcGIS Tile MapServer", "ArcGIS Dynamic MapServer", "1.0.0", "1.3.0 / 1.1.1", "扩展参数", "切片方案", "切片方案管理",
+		"geo-debug-server", "XYZ", "WMTS", "WMS", "ArcGIS Tile MapServer", "ArcGIS Dynamic MapServer", "SuperMap REST Map", "1.0.0", "1.3.0 / 1.1.1", "扩展参数", "切片方案", "切片方案管理",
 		"WebMercatorQuad", "WorldCRS84Quad", "CGCS2000Quad", "EPSG:3857", "CRS:84", "EPSG:4490", "y/x",
 		"http://maps.example.test/geo-debug-server/xyz/{z}/{x}/{y}.png",
 		"href=\"http://maps.example.test/geo-debug-server/xyz/WebMercatorQuad/0/0/0.png\"",
@@ -74,6 +74,10 @@ func TestServiceIndex(t *testing.T) {
 		"href=\"http://maps.example.test/geo-debug-server/ags_rest?f=json\"",
 		"href=\"http://maps.example.test/geo-debug-server/ags_rest/WebMercatorQuad/?f=pjson\"",
 		"href=\"http://maps.example.test/geo-debug-server/ags_rest/export?bbox=-180,-90,180,90&amp;size=512,256&amp;format=png32&amp;transparent=true&amp;f=image\"",
+		"href=\"http://maps.example.test/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad\"",
+		"href=\"http://maps.example.test/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/WebMercatorQuad.json\"",
+		"href=\"http://maps.example.test/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad/tileImage.png?width=512&amp;height=256&amp;scale=0.000001&amp;x=0&amp;y=0&amp;cacheEnabled=true&amp;transparent=true\"",
+		"href=\"/iserver/manager/license.json\"",
 		"href=\"http://maps.example.test/geo-debug-server/schemes\"", "POST http://maps.example.test/geo-debug-server/schemes",
 		"transparent", "bgColor", "color", "time", "90.7142857142857", "ScaleDenominator",
 	} {
@@ -459,6 +463,139 @@ func TestAGSRestExport(t *testing.T) {
 				t.Fatalf("unexpected invalid AGS export response: %d %s", invalid.Code, invalid.Body.String())
 			}
 		})
+	}
+}
+
+func TestSuperMapRESTMetadata(t *testing.T) {
+	handler := testHandler(t)
+	for _, target := range []string{
+		"/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad",
+		"/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad.json",
+	} {
+		response := perform(t, handler, http.MethodGet, target)
+		if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/json; charset=utf-8" {
+			t.Fatalf("unexpected SuperMap metadata response: %d %v %s", response.Code, response.Header(), response.Body.String())
+		}
+		var metadata superMapMetadata
+		if err := json.Unmarshal(response.Body.Bytes(), &metadata); err != nil {
+			t.Fatal(err)
+		}
+		if metadata.Name != store.CGCS2000Quad || metadata.PrjCoordSys.EPSGCode != 4490 ||
+			metadata.Bounds.Left != -180 || metadata.Bounds.Top != 90 || metadata.Origin.X != -180 || metadata.Origin.Y != 90 ||
+			metadata.TileWidth != 256 || metadata.TileHeight != 256 || len(metadata.Resolutions) != 24 {
+			t.Fatalf("unexpected SuperMap metadata: %+v", metadata)
+		}
+	}
+
+	mercator := perform(t, handler, http.MethodGet, "/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/WebMercatorQuad.json")
+	if mercator.Code != http.StatusOK {
+		t.Fatalf("unexpected projected SuperMap metadata response: %d %s", mercator.Code, mercator.Body.String())
+	}
+	var mercatorMetadata superMapMetadata
+	if err := json.Unmarshal(mercator.Body.Bytes(), &mercatorMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if mercatorMetadata.PrjCoordSys.EPSGCode != 3857 || mercatorMetadata.CoordUnit != "METER" ||
+		mercatorMetadata.DistanceUnit != "METER" || mercatorMetadata.ViewBounds.Left != -20037508.342789244 ||
+		mercatorMetadata.ViewBounds.Right != 20037508.342789244 || mercatorMetadata.DynamicProject ||
+		mercatorMetadata.Origin.X != -20037508.342789244 || len(mercatorMetadata.Resolutions) != 23 {
+		t.Fatalf("unexpected EPSG:3857 SuperMap metadata: %+v", mercatorMetadata)
+	}
+	head := perform(t, handler, http.MethodHead, "/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad")
+	if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("Content-Length") == "" {
+		t.Fatalf("unexpected SuperMap metadata HEAD response: status=%d body=%d length=%q", head.Code, head.Body.Len(), head.Header().Get("Content-Length"))
+	}
+	invalid := perform(t, handler, http.MethodGet, "/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/unknown")
+	if invalid.Code != http.StatusNotFound || !strings.Contains(invalid.Body.String(), "\"succeed\": false") {
+		t.Fatalf("unexpected SuperMap invalid-path response: %d %s", invalid.Code, invalid.Body.String())
+	}
+}
+
+func TestSuperMapRESTTileImage(t *testing.T) {
+	handler := testHandler(t)
+	target := "/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad/tileImage.png?width=320&height=180&scale=0.000001&x=-20&y=10&origin=-180,90&bounds=-180,-90,180,90&layersID=show:0&cacheEnabled=true&redirect=false&time=demo&custom=value"
+	response := perform(t, handler, http.MethodGet, target)
+	assertPNG(t, response, 320, 180)
+	if response.Header().Get("Cache-Control") != immutableImageCache {
+		t.Fatalf("unexpected SuperMap image cache header: %q", response.Header().Get("Cache-Control"))
+	}
+
+	defaults := perform(t, handler, http.MethodGet, "/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/WebMercatorQuad/tileImage.png")
+	assertPNG(t, defaults, 256, 256)
+
+	for name, target := range map[string]string{
+		"width":  "/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad/tileImage.png?width=0",
+		"height": "/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad/tileImage.png?height=4097",
+		"path":   "/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad/image.png",
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := perform(t, handler, http.MethodGet, target)
+			if invalid.Code != http.StatusBadRequest && invalid.Code != http.StatusNotFound {
+				t.Fatalf("unexpected invalid SuperMap response: %d %s", invalid.Code, invalid.Body.String())
+			}
+		})
+	}
+}
+
+func TestSuperMapLicenseCompatibilityPath(t *testing.T) {
+	handler := testHandler(t)
+	response := perform(t, handler, http.MethodGet, superMapLicensePath)
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/json; charset=utf-8" {
+		t.Fatalf("unexpected SuperMap license response: %d %v %s", response.Code, response.Header(), response.Body.String())
+	}
+	if response.Header().Get("Cache-Control") != noStoreCache {
+		t.Fatalf("SuperMap license response must not be cached: %q", response.Header().Get("Cache-Control"))
+	}
+	var license map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &license); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		"iServerStandard", "iServerSpatialStreaming", "iServerPlot", "iServerProfessional",
+		"iServerEnterprise", "iServerSpatialProcessing", "iServerBasic", "trialVersion", "iServerUltra",
+	} {
+		if enabled, ok := license[key].(bool); !ok || !enabled {
+			t.Fatalf("SuperMap license %q is not enabled: %#v", key, license[key])
+		}
+	}
+	if license["productType"] != "iServer" {
+		t.Fatalf("unexpected SuperMap product type: %#v", license["productType"])
+	}
+	remote, ok := license["remoteSensingLicenseTypeStruct"].(map[string]any)
+	if !ok || len(remote) != 7 {
+		t.Fatalf("unexpected remote sensing license structure: %#v", license["remoteSensingLicenseTypeStruct"])
+	}
+	for key, value := range remote {
+		if enabled, ok := value.(bool); !ok || !enabled {
+			t.Fatalf("remote sensing license %q is not enabled: %#v", key, value)
+		}
+	}
+	if builder, ok := license["builder"].(map[string]any); !ok || len(builder) != 0 {
+		t.Fatalf("unexpected builder license value: %#v", license["builder"])
+	}
+
+	head := perform(t, handler, http.MethodHead, superMapLicensePath)
+	if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("Content-Length") == "" {
+		t.Fatalf("unexpected SuperMap license HEAD response: status=%d body=%d length=%q", head.Code, head.Body.Len(), head.Header().Get("Content-Length"))
+	}
+	post := perform(t, handler, http.MethodPost, superMapLicensePath)
+	if post.Code != http.StatusMethodNotAllowed || !strings.Contains(post.Header().Get("Allow"), "GET") {
+		t.Fatalf("unexpected SuperMap license method response: %d %v %s", post.Code, post.Header(), post.Body.String())
+	}
+
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "license-custom-base.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	customBase := New(database, config.Config{BasePath: "/base-url"})
+	global := perform(t, customBase, http.MethodGet, superMapLicensePath)
+	if global.Code != http.StatusOK {
+		t.Fatalf("global SuperMap license path depends on base path: %d %s", global.Code, global.Body.String())
+	}
+	insideBase := perform(t, customBase, http.MethodGet, "/base-url"+superMapLicensePath)
+	if insideBase.Code != http.StatusNotFound {
+		t.Fatalf("base-prefixed SuperMap license path must not be served: %d %s", insideBase.Code, insideBase.Body.String())
 	}
 }
 

@@ -1,6 +1,6 @@
 # geo-debug-server
 
-用于定位地图瓦片和动态地图请求问题的轻量调试服务。服务提供 XYZ、WMTS、WMS、ArcGIS Tile MapServer 和 ArcGIS Dynamic MapServer 接口，默认返回透明 PNG；切片图片以黄色边框和居中文字逐行标出 `z`、`x`、`y` 及可选的 `time`。
+用于定位地图瓦片和动态地图请求问题的轻量调试服务。服务提供 XYZ、WMTS、WMS、ArcGIS Tile MapServer、ArcGIS Dynamic MapServer 和 SuperMap REST Map 接口，默认返回透明 PNG；切片图片以黄色边框和居中文字逐行标出 `z`、`x`、`y` 及可选的 `time`。
 
 ## 运行
 
@@ -37,7 +37,7 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 
 ## 当前支持的服务端点
 
-以下路径均以默认基础路径 `/geo-debug-server` 为前缀：
+除特别标注的全局兼容端点外，以下路径均以默认基础路径 `/geo-debug-server` 为前缀：
 
 | 方法 | 端点 | 功能 |
 | --- | --- | --- |
@@ -61,6 +61,9 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 | `GET` / `HEAD` | `/ags_rest/{scheme}/?f=json|pjson` | 使用指定切片方案返回 ArcGIS Dynamic MapServer 元数据 |
 | `GET` / `HEAD` | `/ags_rest/export?...&f=image` | 使用默认切片方案生成 ArcGIS REST 动态图片 |
 | `GET` / `HEAD` | `/ags_rest/{scheme}/export?...&f=json|pjson` | 返回指定方案的 Export Map 结果及图片地址 |
+| `GET` / `HEAD` | `/spm_rest/iserver/services/map-debug/rest/maps/{scheme}` | 根据 SQLite 切片方案返回 SuperMap REST 地图元数据 |
+| `GET` / `HEAD` | `/spm_rest/iserver/services/map-debug/rest/maps/{scheme}/tileImage.png?...` | 根据切片方案和请求参数生成 SuperMap REST 动态调试图片 |
+| `GET` / `HEAD` | `/iserver/manager/license.json` | 返回 SuperMap iServer 许可兼容信息；该全局路径不使用配置的基础路径 |
 | `GET` / `HEAD` | `/schemes` | 列出当前全部切片方案及矩阵层级 |
 | `POST` | `/schemes` | 新增切片方案及完整矩阵层级 |
 | `DELETE` | `/schemes/{scheme}` | 移除切片方案；移除默认方案时自动选择剩余方案作为默认 |
@@ -241,9 +244,34 @@ http://localhost:8080/geo-debug-server/ags_rest/WebMercatorQuad/export?bbox=-200
 
 `bbox` 默认使用方案完整范围，`size` 默认 `256,256`，`bboxSR` 和 `imageSR` 默认使用方案坐标系，`dpi` 默认 96，`format` 默认 `png32`，`transparent` 默认 `true`，`f` 默认 `image`。支持的图片格式为 `png`、`png8`、`png24` 和 `png32`；单边尺寸限制为 8-4096 像素，总像素不超过 16,777,216。首版只展示请求参数，不进行 `bboxSR` 与 `imageSR` 之间的坐标转换。
 
+## SuperMap REST Map
+
+SuperMap REST 风格动态地图服务使用包含 `/iserver/services/map-debug/rest/maps/` 的固定路径结构，便于 iClient 按 URL 识别服务。地图资源名称使用 SQLite 中的切片方案 ID；服务直接读取方案参数，不进行坐标转换：
+
+```text
+http://localhost:8080/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad
+http://localhost:8080/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/WebMercatorQuad.json
+```
+
+元数据中的 CRS、`viewBounds`、`bounds`、`center`、`origin`、瓦片尺寸、层级范围和分辨率均来自对应切片方案。`coordUnit` 根据方案的 `metersPerUnit` 区分米制和角度单位；CRS 仅解析常见 EPSG 标识用于填写 `epsgCode`，不保存或计算投影转换。未知方案返回 `404`。
+
+同一地图资源下的 `tileImage.png` 统一生成动态调试图片。`width`、`height` 默认使用方案瓦片尺寸，图片中的 `origin` 和 `bounds` 来自方案；`scale`、`x`、`y`、`layersID`、`cacheEnabled` 和 `redirect` 仅展示请求值，不进行瓦片矩阵或坐标范围校验：
+
+```text
+http://localhost:8080/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad/tileImage.png?width=512&height=256&scale=0.000001&x=0&y=0&cacheEnabled=true&transparent=true
+```
+
+单边尺寸限制为 8-4096 像素，总像素不超过 16,777,216。`cacheEnabled=true` 不会改变服务端生成逻辑；成功图片仍遵循本服务统一的 HTTP 长期缓存规则。
+
+iClient 加载时访问的许可检查地址固定为域名根路径，不受 `--base-path` 或 `GEO_DEBUG_BASE_PATH` 影响：
+
+```text
+http://localhost:8080/iserver/manager/license.json
+```
+
 ## 调试参数
 
-查询参数名不区分大小写。XYZ、WMTS 和 ArcGIS REST 瓦片仅显示 `z`、`x`、`y`，`time` 仅在显式传入时显示；ArcGIS Dynamic MapServer Export 和 WMS GetMap 还会按参数名排序显示其他参数：
+查询参数名不区分大小写。XYZ、WMTS 和 ArcGIS REST 瓦片仅显示 `z`、`x`、`y`，`time` 仅在显式传入时显示；ArcGIS Dynamic MapServer Export、SuperMap tileImage 和 WMS GetMap 还会按参数名排序显示其他参数：
 
 ```text
 http://localhost:8080/geo-debug-server/xyz/3/4/2.png?time=step-1&source=test
@@ -267,7 +295,7 @@ http://localhost:8080/geo-debug-server/xyz/3/4/2.png?transparent=false&bgColor=F
 
 ## 缓存行为
 
-成功生成的 XYZ、WMTS、WMS 和 ArcGIS REST PNG 默认返回长期不可变缓存：
+成功生成的 XYZ、WMTS、WMS、ArcGIS REST 和 SuperMap REST PNG 默认返回长期不可变缓存：
 
 ```text
 Cache-Control: public, max-age=31536000, immutable
