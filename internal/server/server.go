@@ -40,16 +40,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD, OPTIONS")
-		s.writeError(w, r, http.StatusMethodNotAllowed, "OperationNotSupported", "only GET, HEAD and OPTIONS are supported")
-		return
-	}
 
 	relative, ok := s.relativePath(r.URL.Path)
 	if !ok {
 		w.Header().Set("Cache-Control", noStoreCache)
 		http.Redirect(w, r, s.indexPath(), http.StatusFound)
+		return
+	}
+	if relative == "/schemes" || strings.HasPrefix(relative, "/schemes/") {
+		s.handleSchemes(w, r, relative)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD, OPTIONS")
+		s.writeError(w, r, http.StatusMethodNotAllowed, "OperationNotSupported", "only GET, HEAD and OPTIONS are supported")
 		return
 	}
 	switch {
@@ -61,6 +65,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleWMTS(w, r, relative)
 	case relative == "/wms":
 		s.handleWMS(w, r)
+	case relative == "/ags_tile" || strings.HasPrefix(relative, "/ags_tile/"):
+		s.handleAGSTile(w, r, relative)
 	default:
 		http.NotFound(w, r)
 	}
@@ -149,7 +155,7 @@ func (s *Server) handleWMTS(w http.ResponseWriter, r *http.Request, relative str
 		return
 	}
 
-	schemeID := first(params, "TILEMATRIXSET", store.WebMercatorQuad)
+	schemeID := first(params, "TILEMATRIXSET", "")
 	scheme, err := s.resolveScheme(r.Context(), schemeID)
 	if err != nil {
 		s.writeStoreError(w, r, err)
@@ -388,7 +394,7 @@ func writeResponse(w http.ResponseWriter, r *http.Request, status int, contentTy
 
 func setCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Access-Control-Expose-Headers", "*")
 	w.Header().Set("Access-Control-Max-Age", "86400")

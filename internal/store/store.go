@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,35 +26,37 @@ const (
 
 var (
 	ErrSchemeNotFound = errors.New("tile scheme not found")
+	ErrSchemeExists   = errors.New("tile scheme already exists")
+	ErrInvalidScheme  = errors.New("invalid tile scheme")
 	ErrStoreClosed    = errors.New("tile scheme store is closed")
 )
 
 type Scheme struct {
-	ID               string
-	Name             string
-	CRS              string
-	MetersPerUnit    float64
-	TileWidth        int
-	TileHeight       int
-	MinZoom          int
-	MaxZoom          int
-	OriginX          float64
-	OriginY          float64
-	MinX             float64
-	MinY             float64
-	MaxX             float64
-	MaxY             float64
-	YCoordinateFirst bool
-	IsDefault        bool
-	Levels           []MatrixLevel
+	ID               string        `json:"id"`
+	Name             string        `json:"name"`
+	CRS              string        `json:"crs"`
+	MetersPerUnit    float64       `json:"metersPerUnit"`
+	TileWidth        int           `json:"tileWidth"`
+	TileHeight       int           `json:"tileHeight"`
+	MinZoom          int           `json:"minZoom"`
+	MaxZoom          int           `json:"maxZoom"`
+	OriginX          float64       `json:"originX"`
+	OriginY          float64       `json:"originY"`
+	MinX             float64       `json:"minX"`
+	MinY             float64       `json:"minY"`
+	MaxX             float64       `json:"maxX"`
+	MaxY             float64       `json:"maxY"`
+	YCoordinateFirst bool          `json:"yCoordinateFirst"`
+	IsDefault        bool          `json:"isDefault"`
+	Levels           []MatrixLevel `json:"levels"`
 }
 
 type MatrixLevel struct {
-	Zoom         int
-	Identifier   string
-	Resolution   float64
-	MatrixWidth  int64
-	MatrixHeight int64
+	Zoom         int     `json:"zoom"`
+	Identifier   string  `json:"identifier"`
+	Resolution   float64 `json:"resolution"`
+	MatrixWidth  int64   `json:"matrixWidth"`
+	MatrixHeight int64   `json:"matrixHeight"`
 }
 
 type Bounds struct {
@@ -84,6 +87,10 @@ func Open(ctx context.Context, databasePath string) (*Store, error) {
 }
 
 func OpenWithCacheTTL(ctx context.Context, databasePath string, cacheTTL time.Duration) (*Store, error) {
+	initialize, err := shouldInitializeDatabase(databasePath)
+	if err != nil {
+		return nil, err
+	}
 	dsn, err := databaseDSN(databasePath)
 	if err != nil {
 		return nil, err
@@ -95,11 +102,53 @@ func OpenWithCacheTTL(ctx context.Context, databasePath string, cacheTTL time.Du
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	s := &Store{db: db, cache: make(map[string]*schemeCacheEntry), cacheTTL: cacheTTL}
-	if err := s.init(ctx); err != nil {
+	if initialize {
+		err = s.init(ctx)
+	} else {
+		err = db.PingContext(ctx)
+	}
+	if err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+func shouldInitializeDatabase(databasePath string) (bool, error) {
+	path := databasePath
+	if strings.HasPrefix(path, "file:") {
+		path = strings.TrimPrefix(path, "file:")
+		if index := strings.IndexByte(path, '?'); index >= 0 {
+			query, err := url.ParseQuery(path[index+1:])
+			if err != nil {
+				return false, fmt.Errorf("parse database URI query: %w", err)
+			}
+			if strings.EqualFold(query.Get("mode"), "memory") {
+				return true, nil
+			}
+			path = path[:index]
+		}
+		if path == ":memory:" {
+			return true, nil
+		}
+		decoded, err := url.PathUnescape(path)
+		if err != nil {
+			return false, fmt.Errorf("decode database URI path: %w", err)
+		}
+		path = filepath.FromSlash(decoded)
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false, fmt.Errorf("resolve database path: %w", err)
+	}
+	_, err = os.Stat(absPath)
+	if err == nil {
+		return false, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	return false, fmt.Errorf("stat database file: %w", err)
 }
 
 func databaseDSN(databasePath string) (string, error) {
@@ -148,39 +197,15 @@ func (s *Store) init(ctx context.Context) error {
 		return fmt.Errorf("create database schema: %w", err)
 	}
 	for _, scheme := range defaultSchemes() {
-		if err := seedScheme(ctx, tx, scheme); err != nil {
+		if err := validateScheme(scheme); err != nil {
+			return err
+		}
+		if err := createSchemeTx(ctx, tx, scheme); err != nil {
 			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit database initialization: %w", err)
-	}
-	return nil
-}
-
-func seedScheme(ctx context.Context, tx *sql.Tx, scheme Scheme) error {
-	_, err := tx.ExecContext(ctx, `
-		INSERT INTO tile_schemes(
-			id, name, crs, meters_per_unit, tile_width, tile_height, min_zoom, max_zoom,
-			origin_x, origin_y, min_x, min_y, max_x, max_y, y_coordinate_first, is_default
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO NOTHING`,
-		scheme.ID, scheme.Name, scheme.CRS, scheme.MetersPerUnit, scheme.TileWidth, scheme.TileHeight,
-		scheme.MinZoom, scheme.MaxZoom, scheme.OriginX, scheme.OriginY,
-		scheme.MinX, scheme.MinY, scheme.MaxX, scheme.MaxY, scheme.YCoordinateFirst, scheme.IsDefault)
-	if err != nil {
-		return fmt.Errorf("seed tile scheme %s: %w", scheme.ID, err)
-	}
-	for _, level := range scheme.Levels {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO tile_matrix_levels(
-				scheme_id, zoom, identifier, resolution, matrix_width, matrix_height
-			) VALUES(?, ?, ?, ?, ?, ?)
-			ON CONFLICT DO NOTHING`,
-			scheme.ID, level.Zoom, level.Identifier, level.Resolution,
-			level.MatrixWidth, level.MatrixHeight); err != nil {
-			return fmt.Errorf("seed tile matrix %s/%d: %w", scheme.ID, level.Zoom, err)
-		}
 	}
 	return nil
 }
@@ -453,7 +478,7 @@ func defaultSchemes() []Scheme {
 		TileWidth:     256, TileHeight: 256, MinZoom: 0, MaxZoom: 22,
 		OriginX: -mercatorHalfWorld, OriginY: mercatorHalfWorld,
 		MinX: -mercatorHalfWorld, MinY: -mercatorHalfWorld,
-		MaxX: mercatorHalfWorld, MaxY: mercatorHalfWorld, IsDefault: true,
+		MaxX: mercatorHalfWorld, MaxY: mercatorHalfWorld,
 	}
 	crs84 := Scheme{
 		ID: WorldCRS84Quad, Name: "World CRS84 Quad", CRS: "CRS:84",
@@ -466,7 +491,7 @@ func defaultSchemes() []Scheme {
 		MetersPerUnit: metersPerDegree,
 		TileWidth:     256, TileHeight: 256, MinZoom: 0, MaxZoom: 23,
 		OriginX: -180, OriginY: 90, MinX: -180, MinY: -90, MaxX: 180, MaxY: 90,
-		YCoordinateFirst: true,
+		YCoordinateFirst: true, IsDefault: true,
 	}
 	for zoom := 0; zoom <= 22; zoom++ {
 		factor := math.Exp2(float64(zoom))

@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"image/color"
 	"image/png"
@@ -36,6 +37,16 @@ func perform(t *testing.T, handler http.Handler, method, target string) *httptes
 	return recorder
 }
 
+func performJSON(t *testing.T, handler http.Handler, method, target string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(method, target, bytes.NewReader(body))
+	request.Host = "maps.example.test"
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	return recorder
+}
+
 func TestServiceIndex(t *testing.T) {
 	handler := testHandler(t)
 	response := perform(t, handler, http.MethodGet, "/geo-debug-server/")
@@ -49,10 +60,19 @@ func TestServiceIndex(t *testing.T) {
 		t.Fatalf("unexpected service index security or cache headers: %v", response.Header())
 	}
 	for _, expected := range []string{
-		"geo-debug-server", "XYZ", "WMTS", "WMS", "1.0.0", "1.3.0 / 1.1.1",
+		"geo-debug-server", "XYZ", "WMTS", "WMS", "ArcGIS Tile MapServer", "1.0.0", "1.3.0 / 1.1.1", "扩展参数", "切片方案", "切片方案管理",
+		"WebMercatorQuad", "WorldCRS84Quad", "CGCS2000Quad", "EPSG:3857", "CRS:84", "EPSG:4490", "y/x",
 		"http://maps.example.test/geo-debug-server/xyz/{z}/{x}/{y}.png",
+		"href=\"http://maps.example.test/geo-debug-server/xyz/WebMercatorQuad/0/0/0.png\"",
 		"http://maps.example.test/geo-debug-server/wmts",
+		"http://maps.example.test/geo-debug-server/wmts?REQUEST=GetCapabilities&amp;DPI=96",
+		"href=\"http://maps.example.test/geo-debug-server/wmts/debug/default/WebMercatorQuad/0/0/0.png\"",
 		"http://maps.example.test/geo-debug-server/wms",
+		"http://maps.example.test/geo-debug-server/ags_tile?f=json",
+		"href=\"http://maps.example.test/geo-debug-server/ags_tile/WebMercatorQuad/?f=pjson\"",
+		"href=\"http://maps.example.test/geo-debug-server/ags_tile/WebMercatorQuad/tile/0/0/0\"",
+		"href=\"http://maps.example.test/geo-debug-server/schemes\"", "POST http://maps.example.test/geo-debug-server/schemes",
+		"transparent", "bgColor", "color", "time", "90.7142857142857", "ScaleDenominator",
 	} {
 		if !strings.Contains(response.Body.String(), expected) {
 			t.Fatalf("service index does not contain %q", expected)
@@ -227,6 +247,200 @@ func TestWMSGetMapForLeaflet(t *testing.T) {
 
 	defaults := perform(t, handler, http.MethodGet, "/geo-debug-server/wms?REQUEST=GetMap")
 	assertPNG(t, defaults, 256, 256)
+}
+
+func TestAGSTileMetadata(t *testing.T) {
+	handler := testHandler(t)
+	compact := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_tile?f=json")
+	if compact.Code != http.StatusOK || compact.Header().Get("Content-Type") != "application/json; charset=utf-8" {
+		t.Fatalf("unexpected AGS metadata response: %d %v %s", compact.Code, compact.Header(), compact.Body.String())
+	}
+	var metadata arcGISTileMetadata
+	if err := json.Unmarshal(compact.Body.Bytes(), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.MapName != "CGCS2000 Quad" || !metadata.SingleFusedMapCache {
+		t.Fatalf("unexpected AGS service metadata: %+v", metadata)
+	}
+	if metadata.SpatialReference.WKID != 4490 || metadata.SpatialReference.LatestWKID != 4490 {
+		t.Fatalf("unexpected AGS spatial reference: %+v", metadata.SpatialReference)
+	}
+	if metadata.TileInfo.Rows != 256 || metadata.TileInfo.Cols != 256 || metadata.TileInfo.DPI != 96 || metadata.TileInfo.Format != "PNG32" {
+		t.Fatalf("unexpected AGS tile info: %+v", metadata.TileInfo)
+	}
+	if len(metadata.TileInfo.LODs) != 24 || metadata.TileInfo.LODs[0].Level != 0 {
+		t.Fatalf("unexpected AGS LODs: %+v", metadata.TileInfo.LODs)
+	}
+	expectedScale := scaleDenominator(1.40625, 111319.49079327358, arcGISTileDPI)
+	if math.Abs(metadata.TileInfo.LODs[0].Scale-expectedScale) > expectedScale*1e-12 {
+		t.Fatalf("unexpected AGS level 0 scale: got %.12f want %.12f", metadata.TileInfo.LODs[0].Scale, expectedScale)
+	}
+	if metadata.FullExtent.XMin != -180 || metadata.FullExtent.XMax != 180 {
+		t.Fatalf("unexpected AGS full extent: %+v", metadata.FullExtent)
+	}
+
+	pretty := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_tile?F=PJSON")
+	if pretty.Code != http.StatusOK || !strings.Contains(pretty.Body.String(), "\n  \"tileInfo\"") {
+		t.Fatalf("unexpected AGS PJSON response: %d %s", pretty.Code, pretty.Body.String())
+	}
+	var compacted bytes.Buffer
+	if err := json.Compact(&compacted, pretty.Body.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if compacted.String() != compact.Body.String() {
+		t.Fatal("AGS JSON and PJSON metadata differ")
+	}
+
+	crs84 := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_tile/WorldCRS84Quad/?f=json")
+	var crs84Metadata arcGISTileMetadata
+	if crs84.Code != http.StatusOK {
+		t.Fatalf("unexpected specified-scheme metadata status: %d %s", crs84.Code, crs84.Body.String())
+	}
+	if err := json.Unmarshal(crs84.Body.Bytes(), &crs84Metadata); err != nil {
+		t.Fatal(err)
+	}
+	if crs84Metadata.SpatialReference.WKID != 4326 || len(crs84Metadata.TileInfo.LODs) != 24 || crs84Metadata.TileInfo.Origin.X != -180 {
+		t.Fatalf("unexpected CRS84 AGS metadata: %+v", crs84Metadata)
+	}
+
+	head := perform(t, handler, http.MethodHead, "/geo-debug-server/ags_tile/WebMercatorQuad/?f=json")
+	if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("Content-Length") == "" {
+		t.Fatalf("unexpected AGS metadata HEAD response: status=%d body=%d length=%q", head.Code, head.Body.Len(), head.Header().Get("Content-Length"))
+	}
+	missingFormat := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_tile")
+	if missingFormat.Code != http.StatusBadRequest || missingFormat.Header().Get("Content-Type") != "application/json; charset=utf-8" || !strings.Contains(missingFormat.Body.String(), "\"error\"") {
+		t.Fatalf("unexpected AGS missing format response: %d %s", missingFormat.Code, missingFormat.Body.String())
+	}
+	unknownScheme := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_tile/unknown/?f=pjson")
+	if unknownScheme.Code != http.StatusNotFound || !strings.Contains(unknownScheme.Body.String(), "unknown tile scheme") {
+		t.Fatalf("unexpected AGS unknown-scheme response: %d %s", unknownScheme.Code, unknownScheme.Body.String())
+	}
+}
+
+func TestAGSTilePaths(t *testing.T) {
+	handler := testHandler(t)
+	for _, path := range []string{
+		"/geo-debug-server/ags_tile/tile/3/2/4",
+		"/geo-debug-server/ags_tile/WorldCRS84Quad/tile/1/0/1",
+		"/geo-debug-server/ags_tile/CGCS2000Quad/tile/1/0/1?time=demo",
+	} {
+		response := perform(t, handler, http.MethodGet, path)
+		assertPNG(t, response, 256, 256)
+	}
+	outOfRange := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_tile/tile/0/0/1")
+	if outOfRange.Code != http.StatusBadRequest {
+		t.Fatalf("expected AGS out-of-range status 400, got %d", outOfRange.Code)
+	}
+	unknownScheme := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_tile/unknown/tile/0/0/0")
+	if unknownScheme.Code != http.StatusNotFound || !strings.Contains(unknownScheme.Body.String(), "unknown tile scheme") {
+		t.Fatalf("unexpected AGS tile unknown-scheme response: %d %s", unknownScheme.Code, unknownScheme.Body.String())
+	}
+}
+
+func TestSchemeManagementAPI(t *testing.T) {
+	handler := testHandler(t)
+	list := perform(t, handler, http.MethodGet, "/geo-debug-server/schemes")
+	if list.Code != http.StatusOK || list.Header().Get("Content-Type") != "application/json; charset=utf-8" {
+		t.Fatalf("unexpected scheme list response: %d %v %s", list.Code, list.Header(), list.Body.String())
+	}
+	var initial []store.Scheme
+	if err := json.Unmarshal(list.Body.Bytes(), &initial); err != nil {
+		t.Fatal(err)
+	}
+	if len(initial) != 3 || initial[0].ID != store.CGCS2000Quad || !initial[0].IsDefault {
+		t.Fatalf("unexpected initial scheme list: %+v", initial)
+	}
+	head := perform(t, handler, http.MethodHead, "/geo-debug-server/schemes")
+	if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("Content-Length") == "" {
+		t.Fatalf("unexpected scheme list HEAD response: status=%d body=%d length=%q", head.Code, head.Body.Len(), head.Header().Get("Content-Length"))
+	}
+
+	scheme := managedScheme("ManagedQuad")
+	body, err := json.Marshal(scheme)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := performJSON(t, handler, http.MethodPost, "/geo-debug-server/schemes", body)
+	if created.Code != http.StatusCreated || created.Header().Get("Location") != "/geo-debug-server/schemes/ManagedQuad" {
+		t.Fatalf("unexpected create scheme response: %d %v %s", created.Code, created.Header(), created.Body.String())
+	}
+	var createdScheme store.Scheme
+	if err := json.Unmarshal(created.Body.Bytes(), &createdScheme); err != nil {
+		t.Fatal(err)
+	}
+	if createdScheme.ID != scheme.ID || createdScheme.IsDefault || len(createdScheme.Levels) != 2 {
+		t.Fatalf("unexpected created scheme: %+v", createdScheme)
+	}
+
+	duplicate := scheme
+	duplicate.ID = strings.ToLower(duplicate.ID)
+	duplicateBody, _ := json.Marshal(duplicate)
+	conflict := performJSON(t, handler, http.MethodPost, "/geo-debug-server/schemes", duplicateBody)
+	if conflict.Code != http.StatusConflict || !strings.Contains(conflict.Body.String(), "already exists") {
+		t.Fatalf("unexpected duplicate scheme response: %d %s", conflict.Code, conflict.Body.String())
+	}
+	invalid := performJSON(t, handler, http.MethodPost, "/geo-debug-server/schemes", []byte(`{"id":"broken"}`))
+	if invalid.Code != http.StatusBadRequest || !strings.Contains(invalid.Body.String(), "invalid tile scheme") {
+		t.Fatalf("unexpected invalid scheme response: %d %s", invalid.Code, invalid.Body.String())
+	}
+
+	setDefault := perform(t, handler, http.MethodPut, "/geo-debug-server/schemes/managedquad/default")
+	if setDefault.Code != http.StatusOK {
+		t.Fatalf("unexpected set default response: %d %s", setDefault.Code, setDefault.Body.String())
+	}
+	var defaultScheme store.Scheme
+	if err := json.Unmarshal(setDefault.Body.Bytes(), &defaultScheme); err != nil {
+		t.Fatal(err)
+	}
+	if defaultScheme.ID != scheme.ID || !defaultScheme.IsDefault {
+		t.Fatalf("unexpected default scheme response: %+v", defaultScheme)
+	}
+	metadata := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_tile?f=json")
+	var agsMetadata arcGISTileMetadata
+	if err := json.Unmarshal(metadata.Body.Bytes(), &agsMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if agsMetadata.MapName != scheme.Name {
+		t.Fatalf("default scheme cache was not invalidated: %+v", agsMetadata)
+	}
+
+	deleted := perform(t, handler, http.MethodDelete, "/geo-debug-server/schemes/MANAGEDQUAD")
+	if deleted.Code != http.StatusNoContent || deleted.Body.Len() != 0 {
+		t.Fatalf("unexpected delete scheme response: %d %s", deleted.Code, deleted.Body.String())
+	}
+	metadata = perform(t, handler, http.MethodGet, "/geo-debug-server/ags_tile?f=json")
+	if err := json.Unmarshal(metadata.Body.Bytes(), &agsMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if agsMetadata.MapName != "CGCS2000 Quad" {
+		t.Fatalf("deleting the default did not select a replacement: %+v", agsMetadata)
+	}
+	missing := perform(t, handler, http.MethodDelete, "/geo-debug-server/schemes/missing")
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("unexpected missing scheme deletion response: %d %s", missing.Code, missing.Body.String())
+	}
+
+	patch := perform(t, handler, http.MethodPatch, "/geo-debug-server/schemes")
+	if patch.Code != http.StatusMethodNotAllowed || !strings.Contains(patch.Header().Get("Allow"), "POST") {
+		t.Fatalf("unexpected scheme method response: %d %v %s", patch.Code, patch.Header(), patch.Body.String())
+	}
+	xyzPost := perform(t, handler, http.MethodPost, "/geo-debug-server/xyz/0/0/0.png")
+	if xyzPost.Code != http.StatusMethodNotAllowed || !strings.Contains(xyzPost.Header().Get("Content-Type"), "application/xml") {
+		t.Fatalf("write method leaked into tile endpoint: %d %v %s", xyzPost.Code, xyzPost.Header(), xyzPost.Body.String())
+	}
+}
+
+func managedScheme(id string) store.Scheme {
+	return store.Scheme{
+		ID: id, Name: "Managed Quad", CRS: "EPSG:4326", MetersPerUnit: 111319.49079327358,
+		TileWidth: 256, TileHeight: 256, MinZoom: 0, MaxZoom: 1,
+		OriginX: -180, OriginY: 90, MinX: -180, MinY: -90, MaxX: 180, MaxY: 90,
+		YCoordinateFirst: true,
+		Levels: []store.MatrixLevel{
+			{Zoom: 0, Identifier: "0", Resolution: 1.40625, MatrixWidth: 1, MatrixHeight: 1},
+			{Zoom: 1, Identifier: "1", Resolution: 0.703125, MatrixWidth: 2, MatrixHeight: 1},
+		},
+	}
 }
 
 func TestMetadataListsSchemesAndResourceURLs(t *testing.T) {
@@ -728,6 +942,7 @@ func TestHeadAndOptions(t *testing.T) {
 	}
 	if options.Header().Get("Access-Control-Allow-Origin") != "*" ||
 		options.Header().Get("Access-Control-Allow-Headers") != "*" ||
+		!strings.Contains(options.Header().Get("Access-Control-Allow-Methods"), "DELETE") ||
 		options.Header().Get("Access-Control-Max-Age") != "86400" {
 		t.Fatalf("unexpected permissive CORS headers: %v", options.Header())
 	}

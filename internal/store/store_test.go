@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -30,7 +31,7 @@ func TestDefaultSchemesAndBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !mercator.IsDefault || mercator.YCoordinateFirst || len(mercator.Levels) != 23 {
+	if mercator.IsDefault || mercator.YCoordinateFirst || len(mercator.Levels) != 23 {
 		t.Fatalf("unexpected default scheme: default=%v yFirst=%v levels=%d",
 			mercator.IsDefault, mercator.YCoordinateFirst, len(mercator.Levels))
 	}
@@ -66,7 +67,7 @@ func TestDefaultSchemesAndBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 	cgcsLevel0, ok := cgcs2000.Level("0")
-	if !ok || cgcs2000.CRS != "EPSG:4490" || !cgcs2000.YCoordinateFirst || len(cgcs2000.Levels) != 24 ||
+	if !ok || cgcs2000.CRS != "EPSG:4490" || !cgcs2000.IsDefault || !cgcs2000.YCoordinateFirst || len(cgcs2000.Levels) != 24 ||
 		cgcsLevel0.Resolution != 1.40625 || cgcsLevel0.MatrixWidth != 1 || cgcsLevel0.MatrixHeight != 1 {
 		t.Fatalf("unexpected CGCS2000Quad level 0: scheme=%+v level=%+v", cgcs2000, cgcsLevel0)
 	}
@@ -80,7 +81,7 @@ func TestDefaultSchemesAndBounds(t *testing.T) {
 	}
 }
 
-func TestInitializationDoesNotOverwriteExistingScheme(t *testing.T) {
+func TestExistingDatabaseIsNotReinitialized(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "preserve.db")
 	database, err := Open(ctx, path)
@@ -109,16 +110,12 @@ func TestInitializationDoesNotOverwriteExistingScheme(t *testing.T) {
 	if scheme.Name != "Custom Name" {
 		t.Fatalf("initialization overwrote scheme name: %q", scheme.Name)
 	}
-	added, err := database.Scheme(ctx, CGCS2000Quad)
-	if err != nil {
-		t.Fatalf("initialization did not add the missing CGCS2000 scheme: %v", err)
-	}
-	if !added.YCoordinateFirst {
-		t.Fatal("initialization did not preserve the CGCS2000 axis order")
+	if _, err := database.Scheme(ctx, CGCS2000Quad); !errors.Is(err, ErrSchemeNotFound) {
+		t.Fatalf("existing database unexpectedly restored the deleted scheme: %v", err)
 	}
 }
 
-func TestInitializationFillsMissingLevelsWithoutOverwritingExistingLevels(t *testing.T) {
+func TestExistingDatabaseDoesNotRestoreMissingLevels(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "levels.db")
 	database, err := Open(ctx, path)
@@ -144,12 +141,151 @@ func TestInitializationFillsMissingLevelsWithoutOverwritingExistingLevels(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(scheme.Levels) != 23 {
-		t.Fatalf("expected missing level to be restored, got %d levels", len(scheme.Levels))
+	if len(scheme.Levels) != 22 {
+		t.Fatalf("existing database unexpectedly restored a missing level, got %d levels", len(scheme.Levels))
+	}
+	if _, ok := scheme.Level("7"); ok {
+		t.Fatal("existing database unexpectedly restored level 7")
 	}
 	level8, ok := scheme.Level("8")
 	if !ok || level8.Resolution != 123.5 {
 		t.Fatalf("existing matrix level was overwritten: %+v", level8)
+	}
+}
+
+func TestExistingSQLiteFileIsNotInitialized(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "existing-empty.db")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	database, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var tableCount int
+	if err := database.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tile_schemes'`).Scan(&tableCount); err != nil {
+		t.Fatal(err)
+	}
+	if tableCount != 0 {
+		t.Fatal("existing SQLite file was unexpectedly initialized")
+	}
+}
+
+func TestSchemeManagement(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "management.db")
+	database, err := OpenWithCacheTTL(ctx, path, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scheme := testScheme("LocalQuad")
+	if err := database.CreateScheme(ctx, scheme); err != nil {
+		t.Fatal(err)
+	}
+	created, err := database.Scheme(ctx, strings.ToLower(scheme.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Name != scheme.Name || len(created.Levels) != 2 || created.IsDefault {
+		t.Fatalf("unexpected created scheme: %+v", created)
+	}
+	if err := database.CreateScheme(ctx, testScheme("localquad")); !errors.Is(err, ErrSchemeExists) {
+		t.Fatalf("expected case-insensitive duplicate error, got %v", err)
+	}
+
+	if _, err := database.DefaultScheme(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetDefaultScheme(ctx, strings.ToLower(scheme.ID)); err != nil {
+		t.Fatal(err)
+	}
+	defaultScheme, err := database.DefaultScheme(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultScheme.ID != scheme.ID || !defaultScheme.IsDefault {
+		t.Fatalf("unexpected updated default scheme: %+v", defaultScheme)
+	}
+	oldDefault, err := database.Scheme(ctx, CGCS2000Quad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldDefault.IsDefault {
+		t.Fatal("setting a default scheme left the previous default cached")
+	}
+	if err := database.SetDefaultScheme(ctx, "missing"); !errors.Is(err, ErrSchemeNotFound) {
+		t.Fatalf("expected missing default target error, got %v", err)
+	}
+
+	if err := database.DeleteScheme(ctx, strings.ToLower(scheme.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Scheme(ctx, scheme.ID); !errors.Is(err, ErrSchemeNotFound) {
+		t.Fatalf("deleted scheme is still available: %v", err)
+	}
+	defaultScheme, err = database.DefaultScheme(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultScheme.ID != CGCS2000Quad || !defaultScheme.IsDefault {
+		t.Fatalf("unexpected replacement default scheme: %+v", defaultScheme)
+	}
+	var levelCount int
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tile_matrix_levels WHERE scheme_id = ?`, scheme.ID).Scan(&levelCount); err != nil {
+		t.Fatal(err)
+	}
+	if levelCount != 0 {
+		t.Fatalf("deleted scheme retained %d levels", levelCount)
+	}
+	if err := database.DeleteScheme(ctx, "missing"); !errors.Is(err, ErrSchemeNotFound) {
+		t.Fatalf("expected missing delete target error, got %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := database.Scheme(ctx, scheme.ID); !errors.Is(err, ErrSchemeNotFound) {
+		t.Fatalf("restart restored a deleted custom scheme: %v", err)
+	}
+}
+
+func TestCreateSchemeValidationRollsBack(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "invalid-scheme.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	invalid := testScheme("InvalidQuad")
+	invalid.Levels = invalid.Levels[:1]
+	if err := database.CreateScheme(ctx, invalid); !errors.Is(err, ErrInvalidScheme) {
+		t.Fatalf("expected invalid scheme error, got %v", err)
+	}
+	if _, err := database.Scheme(ctx, invalid.ID); !errors.Is(err, ErrSchemeNotFound) {
+		t.Fatalf("invalid scheme was partially inserted: %v", err)
+	}
+}
+
+func testScheme(id string) Scheme {
+	return Scheme{
+		ID: id, Name: "Local Quad", CRS: "EPSG:4326", MetersPerUnit: 111319.49079327358,
+		TileWidth: 256, TileHeight: 256, MinZoom: 0, MaxZoom: 1,
+		OriginX: -180, OriginY: 90, MinX: -180, MinY: -90, MaxX: 180, MaxY: 90,
+		YCoordinateFirst: true,
+		Levels: []MatrixLevel{
+			{Zoom: 0, Identifier: "0", Resolution: 1.40625, MatrixWidth: 1, MatrixHeight: 1},
+			{Zoom: 1, Identifier: "1", Resolution: 0.703125, MatrixWidth: 2, MatrixHeight: 1},
+		},
 	}
 }
 
@@ -350,7 +486,7 @@ func TestDefaultSchemeCacheExpiresAndReloadsSelection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if initial.ID != WebMercatorQuad {
+	if initial.ID != CGCS2000Quad {
 		t.Fatalf("unexpected initial default: %s", initial.ID)
 	}
 	if _, err := database.db.ExecContext(ctx, `
@@ -361,7 +497,7 @@ func TestDefaultSchemeCacheExpiresAndReloadsSelection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cached.ID != WebMercatorQuad {
+	if cached.ID != CGCS2000Quad {
 		t.Fatalf("default selection changed before cache expiration: %s", cached.ID)
 	}
 

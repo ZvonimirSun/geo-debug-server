@@ -41,7 +41,7 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 
 | 方法 | 端点 | 功能 |
 | --- | --- | --- |
-| `GET` / `HEAD` | `/` | 返回当前服务支持的 XYZ、WMTS、WMS 地址说明页 |
+| `GET` / `HEAD` | `/` | 返回当前服务支持的 XYZ、WMTS、WMS、ArcGIS Tile MapServer 地址说明页 |
 | `GET` / `HEAD` | `/xyz/{z}/{x}/{y}.png` | 使用默认切片方案生成 XYZ 调试瓦片 |
 | `GET` / `HEAD` | `/xyz/{scheme}/{z}/{x}/{y}.png` | 使用指定切片方案生成 XYZ 调试瓦片 |
 | `GET` / `HEAD` | `/wmts` | 返回 WMTS 1.0.0 Capabilities，包含操作、默认参数、图层、切片方案和 `ResourceURL` |
@@ -53,29 +53,68 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 | `GET` / `HEAD` | `/wms` | 返回默认的 WMS 1.3.0 Capabilities，包含操作、默认图层和样式、坐标系、范围及尺寸限制 |
 | `GET` / `HEAD` | `/wms?REQUEST=GetCapabilities&VERSION=1.1.1` | 返回 WMS 1.1.1 Capabilities |
 | `GET` / `HEAD` | `/wms?REQUEST=GetMap&WIDTH={width}&HEIGHT={height}&...` | 按请求尺寸和参数生成 WMS 调试图片 |
+| `GET` / `HEAD` | `/ags_tile?f=json` | 使用默认切片方案返回 ArcGIS Tile MapServer JSON 元数据 |
+| `GET` / `HEAD` | `/ags_tile/{scheme}/?f=pjson` | 使用指定切片方案返回格式化的 ArcGIS Tile MapServer JSON 元数据 |
+| `GET` / `HEAD` | `/ags_tile/tile/{z}/{y}/{x}` | 使用默认切片方案生成 ArcGIS REST 调试瓦片 |
+| `GET` / `HEAD` | `/ags_tile/{scheme}/tile/{z}/{y}/{x}` | 使用指定切片方案生成 ArcGIS REST 调试瓦片 |
+| `GET` / `HEAD` | `/schemes` | 列出当前全部切片方案及矩阵层级 |
+| `POST` | `/schemes` | 新增切片方案及完整矩阵层级 |
+| `DELETE` | `/schemes/{scheme}` | 移除切片方案；移除默认方案时自动选择剩余方案作为默认 |
+| `PUT` | `/schemes/{scheme}/default` | 将指定切片方案设置为唯一默认方案 |
 | `OPTIONS` | 以上全部端点 | 返回跨域预检响应 |
 
 `GET` 返回响应正文；`HEAD` 返回相同响应头但不返回正文。修改 `-base-path` 或 `GEO_DEBUG_BASE_PATH` 后，使用配置后的基础路径替换上述默认前缀。
 
 服务说明页位于配置后的基础路径末尾 `/`。例如默认地址为 `/geo-debug-server/`；将基础路径配置为 `/base-url` 后，说明页地址为 `/base-url/`。基础路径之外的地址（包括不带末尾 `/` 的基础路径）会以 `302` 重定向到说明页；基础路径内未匹配服务端点的地址仍返回 `404`。
 
-XYZ 直接通过路径生成瓦片，不提供 Capabilities；WMTS 和 WMS 提供可由客户端解析的标准 Capabilities。
+XYZ 直接通过路径生成瓦片，不提供 Capabilities；WMTS 和 WMS 提供可由客户端解析的标准 Capabilities；ArcGIS Tile MapServer 提供 JSON 元数据。
 
 ## 默认切片方案
 
-首次启动会自动创建数据库并补齐以下方案。已有方案不会被初始化逻辑覆盖。
+仅当配置的 SQLite 文件不存在时，服务才会创建数据库并通过方案新增逻辑插入以下初始方案。只要文件已经存在，启动过程就不会建表、补方案、补层级或修改默认值；未来表结构变化将通过独立版本和迁移脚本处理。
 
-| 标识 | 坐标系 | z0 矩阵 | 层级 | 瓦片大小 |
-| --- | --- | --- | --- | --- |
-| `WebMercatorQuad` | `EPSG:3857` | 1x1 | 0-22 | 256x256 |
-| `WorldCRS84Quad` | `CRS:84` | 1x1 | 0-23 | 256x256 |
-| `CGCS2000Quad` | `EPSG:4490` | 1x1 | 0-23 | 256x256 |
+| 标识 | 坐标系 | z0 矩阵 | 层级 | 瓦片大小 | 默认 |
+| --- | --- | --- | --- | --- | --- |
+| `WebMercatorQuad` | `EPSG:3857` | 1x1 | 0-22 | 256x256 | 否 |
+| `WorldCRS84Quad` | `CRS:84` | 1x1 | 0-23 | 256x256 | 否 |
+| `CGCS2000Quad` | `EPSG:4490` | 1x1 | 0-23 | 256x256 | 是 |
 
 两个经纬度方案的 `z0` 分辨率为 `1.40625`，比例尺与 `WebMercatorQuad z0` 对齐；原先以 `0.703125` 开始的层级顺延为 `z1`，矩阵为 `2x1`。
 
-切片方案保存在 `tile_schemes`，每一级参数保存在 `tile_matrix_levels`。数据库只保存层级分辨率，Capabilities 中的 `ScaleDenominator` 根据分辨率、方案坐标单位和请求 DPI 动态计算。`tile_schemes.y_coordinate_first` 用于指定 WMTS 元数据是否按 y/x 输出坐标；值为 `1` 时交换内部 x/y 顺序，值为 `0` 时保持 x/y。首版不提供管理 API，可以直接查看 SQLite 数据确认方案参数。
+切片方案保存在 `tile_schemes`，每一级参数保存在 `tile_matrix_levels`。数据库只保存层级分辨率，Capabilities 中的 `ScaleDenominator` 根据分辨率、方案坐标单位和请求 DPI 动态计算。`tile_schemes.y_coordinate_first` 用于指定 WMTS 元数据是否按 y/x 输出坐标；值为 `1` 时交换内部 x/y 顺序，值为 `0` 时保持 x/y。
 
 服务会在进程内缓存查询成功的切片方案及层级信息，默认滑动 TTL 为 5 分钟。每次命中都会重新续期；超过 TTL 未访问的方案会自动从内存释放，下次请求重新读取 SQLite。并发缓存 miss 只会执行一次 SQLite 加载。直接修改数据库后，变更最迟在对应缓存停止访问并过期后可见。
+
+### 切片方案管理
+
+管理接口使用 JSON 且不包含应用内授权逻辑。新增请求必须提供从 `minZoom` 到 `maxZoom` 的全部矩阵层级，整个方案在同一 SQLite 事务内写入。例如：
+
+```json
+{
+  "id": "LocalQuad",
+  "name": "Local Quad",
+  "crs": "EPSG:4326",
+  "metersPerUnit": 111319.49079327358,
+  "tileWidth": 256,
+  "tileHeight": 256,
+  "minZoom": 0,
+  "maxZoom": 1,
+  "originX": -180,
+  "originY": 90,
+  "minX": -180,
+  "minY": -90,
+  "maxX": 180,
+  "maxY": 90,
+  "yCoordinateFirst": true,
+  "isDefault": false,
+  "levels": [
+    {"zoom": 0, "identifier": "0", "resolution": 1.40625, "matrixWidth": 1, "matrixHeight": 1},
+    {"zoom": 1, "identifier": "1", "resolution": 0.703125, "matrixWidth": 2, "matrixHeight": 1}
+  ]
+}
+```
+
+方案 ID 大小写不敏感且不能包含路径分隔符。重复 ID 返回 `409`，无效方案返回 `400`，未知方案返回 `404`。新增、移除和设置默认成功后会立即清除方案内存缓存。
 
 ```sh
 geo-debug-server --scheme-cache-ttl 30s
@@ -84,7 +123,7 @@ geo-debug-server --scheme-cache-ttl 0
 
 ## XYZ
 
-默认 Web Mercator：
+默认 CGCS2000：
 
 ```text
 http://localhost:8080/geo-debug-server/xyz/{z}/{x}/{y}.png
@@ -125,7 +164,7 @@ VERSION=1.0.0
 LAYER=debug
 STYLE=default
 FORMAT=image/png
-TILEMATRIXSET=WebMercatorQuad
+TILEMATRIXSET=CGCS2000Quad
 ```
 
 `TILEMATRIX`、`TILEROW`、`TILECOL` 必须提供。例如：
@@ -161,9 +200,25 @@ http://localhost:8080/geo-debug-server/wms?REQUEST=GetMap&LAYERS=debug&CRS=EPSG:
 
 XYZ 是路径式调试切片接口，不定义协议版本，也不提供 Capabilities。
 
+## ArcGIS Tile MapServer
+
+ArcGIS REST 风格切片服务通过 `ags_tile` 路径提供。元数据请求必须指定 `f=json` 或 `f=pjson`；两者字段相同，`pjson` 使用缩进格式便于查看。默认方案和指定方案示例：
+
+```text
+http://localhost:8080/geo-debug-server/ags_tile?f=json
+http://localhost:8080/geo-debug-server/ags_tile/WebMercatorQuad/?f=pjson
+```
+
+元数据包含空间参考、完整范围、原点、瓦片尺寸、96 DPI、LOD 分辨率与比例尺等 Tile MapServer 常用字段。瓦片路径为：
+
+```text
+http://localhost:8080/geo-debug-server/ags_tile/tile/{z}/{y}/{x}
+http://localhost:8080/geo-debug-server/ags_tile/{scheme}/tile/{z}/{y}/{x}
+```
+
 ## 调试参数
 
-查询参数名不区分大小写。XYZ 和 WMTS 瓦片仅显示 `z`、`x`、`y`，`time` 仅在显式传入时显示；其他参数不会显示在图片中：
+查询参数名不区分大小写。XYZ、WMTS 和 ArcGIS REST 瓦片仅显示 `z`、`x`、`y`，`time` 仅在显式传入时显示；其他参数不会显示在图片中：
 
 ```text
 http://localhost:8080/geo-debug-server/xyz/3/4/2.png?time=step-1&source=test
@@ -183,7 +238,7 @@ http://localhost:8080/geo-debug-server/xyz/3/4/2.png?time=step-1&source=test
 http://localhost:8080/geo-debug-server/xyz/3/4/2.png?transparent=false&bgColor=FFF8&color=003366CC
 ```
 
-文字会先按像素宽度换行；内容超出高度时自动缩小字号并重新排版。所有响应允许任意来源跨域访问、任意请求头和任意响应头，并支持 `GET`、`HEAD` 和 `OPTIONS`。预检响应缓存 24 小时，不启用跨域凭据模式。
+文字会先按像素宽度换行；内容超出高度时自动缩小字号并重新排版。所有响应允许任意来源跨域访问、任意请求头和任意响应头；跨域方法包含 `GET`、`HEAD`、`POST`、`PUT`、`DELETE` 和 `OPTIONS`。预检响应缓存 24 小时，不启用跨域凭据模式。
 
 ## 缓存行为
 
