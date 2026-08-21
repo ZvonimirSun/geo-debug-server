@@ -67,6 +67,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleWMS(w, r)
 	case relative == "/ags_tile" || strings.HasPrefix(relative, "/ags_tile/"):
 		s.handleAGSTile(w, r, relative)
+	case relative == "/ags_rest" || strings.HasPrefix(relative, "/ags_rest/"):
+		s.handleAGSRest(w, r, relative)
 	default:
 		http.NotFound(w, r)
 	}

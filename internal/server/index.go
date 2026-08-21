@@ -124,15 +124,29 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
     </section>
 
     <section>
+      <div class="section-heading"><h2>ArcGIS Dynamic MapServer</h2><span class="version">REST</span></div>
+      <table>
+        <tbody>
+          <tr><th>JSON 元数据</th><td><a href="{{.Root}}/ags_rest?f=json"><code>{{.Root}}/ags_rest?f=json</code></a></td></tr>
+          <tr><th>PJSON 元数据</th><td><a href="{{.Root}}/ags_rest?f=pjson"><code>{{.Root}}/ags_rest?f=pjson</code></a></td></tr>
+          <tr><th>指定方案元数据</th><td><a href="{{.Root}}/ags_rest/WebMercatorQuad/?f=pjson"><code>{{.Root}}/ags_rest/{scheme}/?f=pjson</code></a></td></tr>
+          <tr><th>动态图片</th><td><a href="{{.Root}}/ags_rest/export?bbox=-180,-90,180,90&amp;size=512,256&amp;format=png32&amp;transparent=true&amp;f=image"><code>{{.Root}}/ags_rest/export?bbox={xmin},{ymin},{xmax},{ymax}&amp;size={width},{height}&amp;f=image</code></a></td></tr>
+          <tr><th>Export JSON</th><td><a href="{{.Root}}/ags_rest/export?bbox=-180,-90,180,90&amp;size=512,256&amp;format=png32&amp;f=pjson"><code>{{.Root}}/ags_rest/export?...&amp;f=json|pjson</code></a></td></tr>
+          <tr><th>指定方案 Export</th><td><a href="{{.Root}}/ags_rest/WebMercatorQuad/export?bbox=-20037508.342789244,-20037508.342789244,20037508.342789244,20037508.342789244&amp;size=512,256&amp;f=image"><code>{{.Root}}/ags_rest/{scheme}/export?...&amp;f=image</code></a></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
       <div class="section-heading"><h2>扩展参数</h2><span class="version">QUERY</span></div>
       <table>
         <tbody>
-          <tr><th><code>time</code></th><td>适用于 XYZ、WMTS、AGS 瓦片和 WMS GetMap；仅在显式传入时显示在图片中。</td></tr>
+          <tr><th><code>time</code></th><td>适用于 XYZ、WMTS、AGS 瓦片、AGS REST Export 和 WMS GetMap；仅在显式传入时显示在图片中。</td></tr>
           <tr><th><code>transparent</code></th><td>适用于所有图片接口；默认为透明，设为 <code>false</code> 时填充背景。</td></tr>
           <tr><th><code>bgColor</code></th><td>适用于所有图片接口；背景色支持 <code>RGB</code>、<code>RGBA</code>、<code>RRGGBB</code>、<code>RRGGBBAA</code>，无需 <code>#</code>，仅在 <code>transparent=false</code> 时生效。</td></tr>
           <tr><th><code>color</code></th><td>适用于所有图片接口；使用与 <code>bgColor</code> 相同的颜色格式设置文字和边框颜色，默认为 <code>FFFF00</code>。</td></tr>
-          <tr><th><code>dpi</code></th><td>仅适用于 WMTS KVP/REST Capabilities；必须为有限正数，缺省为 <code>90.7142857142857</code>，仅换算 <code>ScaleDenominator</code>。</td></tr>
-          <tr><th>其他查询参数</th><td>WMS GetMap 会按参数名排序后显示；XYZ、WMTS 和 AGS 瓦片不会显示未识别参数。参数名均不区分大小写。</td></tr>
+          <tr><th><code>dpi</code></th><td>必须为有限正数；WMTS Capabilities 缺省为 <code>90.7142857142857</code> 并换算 <code>ScaleDenominator</code>，AGS REST Export 缺省为 <code>96</code> 并用于 Export 比例尺。</td></tr>
+          <tr><th>其他查询参数</th><td>WMS GetMap 和 AGS REST Export 会按参数名排序后显示；XYZ、WMTS 和 AGS 瓦片不会显示未识别参数。参数名均不区分大小写。</td></tr>
         </tbody>
       </table>
     </section>

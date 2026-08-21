@@ -1,6 +1,6 @@
 # geo-debug-server
 
-用于定位地图瓦片请求问题的轻量调试服务。服务提供 XYZ、WMTS 和 WMS 接口，默认返回透明 PNG；XYZ 和 WMTS 瓦片以黄色边框和居中文字逐行标出 `z`、`x`、`y` 及可选的 `time`。
+用于定位地图瓦片和动态地图请求问题的轻量调试服务。服务提供 XYZ、WMTS、WMS、ArcGIS Tile MapServer 和 ArcGIS Dynamic MapServer 接口，默认返回透明 PNG；切片图片以黄色边框和居中文字逐行标出 `z`、`x`、`y` 及可选的 `time`。
 
 ## 运行
 
@@ -41,7 +41,7 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 
 | 方法 | 端点 | 功能 |
 | --- | --- | --- |
-| `GET` / `HEAD` | `/` | 返回当前服务支持的 XYZ、WMTS、WMS、ArcGIS Tile MapServer 地址说明页 |
+| `GET` / `HEAD` | `/` | 返回当前服务支持的全部服务地址说明页 |
 | `GET` / `HEAD` | `/xyz/{z}/{x}/{y}.png` | 使用默认切片方案生成 XYZ 调试瓦片 |
 | `GET` / `HEAD` | `/xyz/{scheme}/{z}/{x}/{y}.png` | 使用指定切片方案生成 XYZ 调试瓦片 |
 | `GET` / `HEAD` | `/wmts` | 返回 WMTS 1.0.0 Capabilities，包含操作、默认参数、图层、切片方案和 `ResourceURL` |
@@ -57,6 +57,10 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 | `GET` / `HEAD` | `/ags_tile/{scheme}/?f=pjson` | 使用指定切片方案返回格式化的 ArcGIS Tile MapServer JSON 元数据 |
 | `GET` / `HEAD` | `/ags_tile/tile/{z}/{y}/{x}` | 使用默认切片方案生成 ArcGIS REST 调试瓦片 |
 | `GET` / `HEAD` | `/ags_tile/{scheme}/tile/{z}/{y}/{x}` | 使用指定切片方案生成 ArcGIS REST 调试瓦片 |
+| `GET` / `HEAD` | `/ags_rest?f=json|pjson` | 使用默认切片方案返回 ArcGIS Dynamic MapServer 元数据 |
+| `GET` / `HEAD` | `/ags_rest/{scheme}/?f=json|pjson` | 使用指定切片方案返回 ArcGIS Dynamic MapServer 元数据 |
+| `GET` / `HEAD` | `/ags_rest/export?...&f=image` | 使用默认切片方案生成 ArcGIS REST 动态图片 |
+| `GET` / `HEAD` | `/ags_rest/{scheme}/export?...&f=json|pjson` | 返回指定方案的 Export Map 结果及图片地址 |
 | `GET` / `HEAD` | `/schemes` | 列出当前全部切片方案及矩阵层级 |
 | `POST` | `/schemes` | 新增切片方案及完整矩阵层级 |
 | `DELETE` | `/schemes/{scheme}` | 移除切片方案；移除默认方案时自动选择剩余方案作为默认 |
@@ -67,7 +71,7 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 
 服务说明页位于配置后的基础路径末尾 `/`。例如默认地址为 `/geo-debug-server/`；将基础路径配置为 `/base-url` 后，说明页地址为 `/base-url/`。基础路径之外的地址（包括不带末尾 `/` 的基础路径）会以 `302` 重定向到说明页；基础路径内未匹配服务端点的地址仍返回 `404`。
 
-XYZ 直接通过路径生成瓦片，不提供 Capabilities；WMTS 和 WMS 提供可由客户端解析的标准 Capabilities；ArcGIS Tile MapServer 提供 JSON 元数据。
+XYZ 直接通过路径生成瓦片，不提供 Capabilities；WMTS 和 WMS 提供可由客户端解析的标准 Capabilities；ArcGIS Tile MapServer 和 Dynamic MapServer 提供 JSON 元数据。
 
 ## 默认切片方案
 
@@ -216,9 +220,30 @@ http://localhost:8080/geo-debug-server/ags_tile/tile/{z}/{y}/{x}
 http://localhost:8080/geo-debug-server/ags_tile/{scheme}/tile/{z}/{y}/{x}
 ```
 
+## ArcGIS Dynamic MapServer
+
+ArcGIS REST 风格动态地图服务通过 `ags_rest` 路径提供。元数据请求必须指定 `f=json` 或 `f=pjson`，默认使用当前默认切片方案，也可在路径中指定方案：
+
+```text
+http://localhost:8080/geo-debug-server/ags_rest?f=pjson
+http://localhost:8080/geo-debug-server/ags_rest/WebMercatorQuad/?f=pjson
+```
+
+元数据包含空间参考、完整范围、图层、支持的图片格式和最大出图尺寸，并标记 `supportsDynamicLayers=true`、`singleFusedMapCache=false`。该动态服务不返回切片服务专用的 `tileInfo`。
+
+`export` 支持直接返回 PNG，也支持返回包含图片地址、尺寸、范围和比例尺的 JSON/PJSON：
+
+```text
+http://localhost:8080/geo-debug-server/ags_rest/export?bbox=-180,-90,180,90&size=512,256&bboxSR=4490&imageSR=4490&dpi=96&format=png32&transparent=true&f=image
+http://localhost:8080/geo-debug-server/ags_rest/export?bbox=-180,-90,180,90&size=512,256&f=pjson
+http://localhost:8080/geo-debug-server/ags_rest/WebMercatorQuad/export?bbox=-20037508.342789244,-20037508.342789244,20037508.342789244,20037508.342789244&size=512,256&f=image
+```
+
+`bbox` 默认使用方案完整范围，`size` 默认 `256,256`，`bboxSR` 和 `imageSR` 默认使用方案坐标系，`dpi` 默认 96，`format` 默认 `png32`，`transparent` 默认 `true`，`f` 默认 `image`。支持的图片格式为 `png`、`png8`、`png24` 和 `png32`；单边尺寸限制为 8-4096 像素，总像素不超过 16,777,216。首版只展示请求参数，不进行 `bboxSR` 与 `imageSR` 之间的坐标转换。
+
 ## 调试参数
 
-查询参数名不区分大小写。XYZ、WMTS 和 ArcGIS REST 瓦片仅显示 `z`、`x`、`y`，`time` 仅在显式传入时显示；其他参数不会显示在图片中：
+查询参数名不区分大小写。XYZ、WMTS 和 ArcGIS REST 瓦片仅显示 `z`、`x`、`y`，`time` 仅在显式传入时显示；ArcGIS Dynamic MapServer Export 和 WMS GetMap 还会按参数名排序显示其他参数：
 
 ```text
 http://localhost:8080/geo-debug-server/xyz/3/4/2.png?time=step-1&source=test
@@ -242,7 +267,7 @@ http://localhost:8080/geo-debug-server/xyz/3/4/2.png?transparent=false&bgColor=F
 
 ## 缓存行为
 
-成功生成的 XYZ、WMTS 和 WMS PNG 默认返回长期不可变缓存：
+成功生成的 XYZ、WMTS、WMS 和 ArcGIS REST PNG 默认返回长期不可变缓存：
 
 ```text
 Cache-Control: public, max-age=31536000, immutable

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -195,19 +196,19 @@ func arcGISUnits(scheme store.Scheme) string {
 }
 
 func (s *Server) writeAGSJSON(w http.ResponseWriter, r *http.Request, status int, value any, pretty bool) {
-	var (
-		data []byte
-		err  error
-	)
+	var output bytes.Buffer
+	encoder := json.NewEncoder(&output)
+	encoder.SetEscapeHTML(false)
 	if pretty {
-		data, err = json.MarshalIndent(value, "", "  ")
-		data = append(data, '\n')
-	} else {
-		data, err = json.Marshal(value)
+		encoder.SetIndent("", "  ")
 	}
-	if err != nil {
+	if err := encoder.Encode(value); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "NoApplicableCode", "encode ArcGIS response: "+err.Error())
 		return
+	}
+	data := output.Bytes()
+	if !pretty {
+		data = bytes.TrimSuffix(data, []byte{'\n'})
 	}
 	writeResponse(w, r, status, "application/json; charset=utf-8", data)
 }

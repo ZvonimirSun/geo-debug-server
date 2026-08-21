@@ -60,7 +60,7 @@ func TestServiceIndex(t *testing.T) {
 		t.Fatalf("unexpected service index security or cache headers: %v", response.Header())
 	}
 	for _, expected := range []string{
-		"geo-debug-server", "XYZ", "WMTS", "WMS", "ArcGIS Tile MapServer", "1.0.0", "1.3.0 / 1.1.1", "扩展参数", "切片方案", "切片方案管理",
+		"geo-debug-server", "XYZ", "WMTS", "WMS", "ArcGIS Tile MapServer", "ArcGIS Dynamic MapServer", "1.0.0", "1.3.0 / 1.1.1", "扩展参数", "切片方案", "切片方案管理",
 		"WebMercatorQuad", "WorldCRS84Quad", "CGCS2000Quad", "EPSG:3857", "CRS:84", "EPSG:4490", "y/x",
 		"http://maps.example.test/geo-debug-server/xyz/{z}/{x}/{y}.png",
 		"href=\"http://maps.example.test/geo-debug-server/xyz/WebMercatorQuad/0/0/0.png\"",
@@ -71,6 +71,9 @@ func TestServiceIndex(t *testing.T) {
 		"http://maps.example.test/geo-debug-server/ags_tile?f=json",
 		"href=\"http://maps.example.test/geo-debug-server/ags_tile/WebMercatorQuad/?f=pjson\"",
 		"href=\"http://maps.example.test/geo-debug-server/ags_tile/WebMercatorQuad/tile/0/0/0\"",
+		"href=\"http://maps.example.test/geo-debug-server/ags_rest?f=json\"",
+		"href=\"http://maps.example.test/geo-debug-server/ags_rest/WebMercatorQuad/?f=pjson\"",
+		"href=\"http://maps.example.test/geo-debug-server/ags_rest/export?bbox=-180,-90,180,90&amp;size=512,256&amp;format=png32&amp;transparent=true&amp;f=image\"",
 		"href=\"http://maps.example.test/geo-debug-server/schemes\"", "POST http://maps.example.test/geo-debug-server/schemes",
 		"transparent", "bgColor", "color", "time", "90.7142857142857", "ScaleDenominator",
 	} {
@@ -334,6 +337,128 @@ func TestAGSTilePaths(t *testing.T) {
 	unknownScheme := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_tile/unknown/tile/0/0/0")
 	if unknownScheme.Code != http.StatusNotFound || !strings.Contains(unknownScheme.Body.String(), "unknown tile scheme") {
 		t.Fatalf("unexpected AGS tile unknown-scheme response: %d %s", unknownScheme.Code, unknownScheme.Body.String())
+	}
+}
+
+func TestAGSRestMetadata(t *testing.T) {
+	handler := testHandler(t)
+	compact := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_rest?f=json")
+	if compact.Code != http.StatusOK || compact.Header().Get("Content-Type") != "application/json; charset=utf-8" {
+		t.Fatalf("unexpected AGS dynamic metadata response: %d %v %s", compact.Code, compact.Header(), compact.Body.String())
+	}
+	var metadata arcGISDynamicMetadata
+	if err := json.Unmarshal(compact.Body.Bytes(), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.MapName != "CGCS2000 Quad" || !metadata.SupportsDynamicLayers || metadata.SingleFusedMapCache {
+		t.Fatalf("unexpected AGS dynamic service metadata: %+v", metadata)
+	}
+	if metadata.SpatialReference.WKID != 4490 || metadata.SpatialReference.LatestWKID != 4490 {
+		t.Fatalf("unexpected AGS dynamic spatial reference: %+v", metadata.SpatialReference)
+	}
+	if strings.Contains(compact.Body.String(), "\"tileInfo\"") {
+		t.Fatal("dynamic MapServer metadata must not include tileInfo")
+	}
+
+	pretty := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_rest?F=PJSON")
+	if pretty.Code != http.StatusOK || !strings.Contains(pretty.Body.String(), "\n  \"supportsDynamicLayers\"") {
+		t.Fatalf("unexpected AGS dynamic PJSON response: %d %s", pretty.Code, pretty.Body.String())
+	}
+	var compacted bytes.Buffer
+	if err := json.Compact(&compacted, pretty.Body.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if compacted.String() != compact.Body.String() {
+		t.Fatal("AGS dynamic JSON and PJSON metadata differ")
+	}
+
+	mercator := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_rest/WebMercatorQuad/?f=json")
+	var mercatorMetadata arcGISDynamicMetadata
+	if err := json.Unmarshal(mercator.Body.Bytes(), &mercatorMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if mercator.Code != http.StatusOK || mercatorMetadata.SpatialReference.WKID != 102100 || mercatorMetadata.SpatialReference.LatestWKID != 3857 {
+		t.Fatalf("unexpected specified-scheme AGS dynamic metadata: %d %+v", mercator.Code, mercatorMetadata)
+	}
+
+	head := perform(t, handler, http.MethodHead, "/geo-debug-server/ags_rest?f=json")
+	if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("Content-Length") == "" {
+		t.Fatalf("unexpected AGS dynamic metadata HEAD response: status=%d body=%d length=%q", head.Code, head.Body.Len(), head.Header().Get("Content-Length"))
+	}
+	for name, target := range map[string]string{
+		"missing format": "/geo-debug-server/ags_rest",
+		"invalid format": "/geo-debug-server/ags_rest?f=html",
+		"unknown scheme": "/geo-debug-server/ags_rest/unknown/?f=pjson",
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := perform(t, handler, http.MethodGet, target)
+			if response.Code != http.StatusBadRequest && response.Code != http.StatusNotFound {
+				t.Fatalf("unexpected AGS dynamic error response: %d %s", response.Code, response.Body.String())
+			}
+			if response.Header().Get("Content-Type") != "application/json; charset=utf-8" || !strings.Contains(response.Body.String(), "\"error\"") {
+				t.Fatalf("unexpected AGS dynamic error payload: %v %s", response.Header(), response.Body.String())
+			}
+		})
+	}
+}
+
+func TestAGSRestExport(t *testing.T) {
+	handler := testHandler(t)
+	imageTarget := "/geo-debug-server/ags_rest/export?bbox=-180,-90,180,90&size=320,180&bboxSR=4490&imageSR=4490&dpi=96&format=png32&transparent=true&time=demo&custom=value&f=image"
+	imageResponse := perform(t, handler, http.MethodGet, imageTarget)
+	assertPNG(t, imageResponse, 320, 180)
+	if imageResponse.Header().Get("Cache-Control") != immutableImageCache {
+		t.Fatalf("unexpected AGS dynamic image cache header: %q", imageResponse.Header().Get("Cache-Control"))
+	}
+
+	jsonTarget := "/geo-debug-server/ags_rest/export?bbox=-180,-90,180,90&size=320,180&bboxSR=4490&imageSR=4490&dpi=96&format=png32&F=PJSON"
+	request := httptest.NewRequest(http.MethodGet, jsonTarget, nil)
+	request.Host = "internal:8080"
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("X-Forwarded-Host", "maps.example.test")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("unexpected AGS export result: %d %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), `\u0026`) || !strings.Contains(response.Body.String(), `&f=image&`) {
+		t.Fatalf("AGS export href is not directly copyable: %s", response.Body.String())
+	}
+	var result arcGISExportResult
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Width != 320 || result.Height != 180 || result.Extent.SpatialReference.WKID != 4490 || result.Scale <= 0 {
+		t.Fatalf("unexpected AGS export result fields: %+v", result)
+	}
+	if !strings.HasPrefix(result.Href, "https://maps.example.test/geo-debug-server/ags_rest/export?") || strings.Count(strings.ToLower(result.Href), "f=image") != 1 || strings.Contains(strings.ToLower(result.Href), "f=pjson") {
+		t.Fatalf("unexpected AGS export image URL: %q", result.Href)
+	}
+	imageFromResult := perform(t, handler, http.MethodGet, strings.TrimPrefix(result.Href, "https://maps.example.test"))
+	assertPNG(t, imageFromResult, 320, 180)
+
+	mercator := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_rest/WebMercatorQuad/export?bbox=-1000,-500,1000,500&size=256,128&f=json")
+	var mercatorResult arcGISExportResult
+	if err := json.Unmarshal(mercator.Body.Bytes(), &mercatorResult); err != nil {
+		t.Fatal(err)
+	}
+	if mercator.Code != http.StatusOK || mercatorResult.Extent.SpatialReference.WKID != 102100 {
+		t.Fatalf("unexpected specified-scheme AGS export result: %d %+v", mercator.Code, mercatorResult)
+	}
+
+	for name, query := range map[string]string{
+		"bbox":   "bbox=0,0,0,1&f=image",
+		"size":   "size=4097,256&f=image",
+		"dpi":    "dpi=invalid&f=image",
+		"format": "format=jpg&f=image",
+		"output": "f=html",
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := perform(t, handler, http.MethodGet, "/geo-debug-server/ags_rest/export?"+query)
+			if invalid.Code != http.StatusBadRequest || !strings.Contains(invalid.Body.String(), "\"error\"") {
+				t.Fatalf("unexpected invalid AGS export response: %d %s", invalid.Code, invalid.Body.String())
+			}
+		})
 	}
 }
 
