@@ -2,7 +2,10 @@ package server
 
 import "net/http"
 
-const superMapLicensePath = "/iserver/manager/license.json"
+const (
+	superMapRESTLicensePath = "/spm_rest/iserver/manager/license.json"
+	superMapTileLicensePath = "/spm_tile/iserver/manager/license.json"
+)
 
 var superMapLicenseJSON = []byte(`{
   "iServerStandard": true,

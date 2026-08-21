@@ -144,7 +144,20 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
           <tr><th>默认方案元数据</th><td><a href="{{.Root}}/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad"><code>{{.Root}}/spm_rest/iserver/services/map-debug/rest/maps/{scheme}</code></a></td></tr>
           <tr><th>Mercator 元数据</th><td><a href="{{.Root}}/spm_rest/iserver/services/map-debug/rest/maps/WebMercatorQuad.json"><code>{{.Root}}/spm_rest/iserver/services/map-debug/rest/maps/WebMercatorQuad.json</code></a></td></tr>
           <tr><th>动态图片</th><td><a href="{{.Root}}/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad/tileImage.png?width=512&amp;height=256&amp;scale=0.000001&amp;x=0&amp;y=0&amp;cacheEnabled=true&amp;transparent=true"><code>{{.Root}}/spm_rest/iserver/services/map-debug/rest/maps/{scheme}/tileImage.png?width={width}&amp;height={height}&amp;scale={scale}&amp;x={x}&amp;y={y}</code></a></td></tr>
-          <tr><th>许可兼容层</th><td><a href="/iserver/manager/license.json"><code>/iserver/manager/license.json</code></a>（忽略基础路径）</td></tr>
+          <tr><th>非切片标记</th><td><a href="{{.Root}}/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad/tilesets.json"><code>{{.Root}}/spm_rest/iserver/services/map-debug/rest/maps/{scheme}/tilesets.json</code></a></td></tr>
+          <tr><th>许可兼容层</th><td><a href="{{.Root}}/spm_rest/iserver/manager/license.json"><code>{{.Root}}/spm_rest/iserver/manager/license.json</code></a></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <div class="section-heading"><h2>SuperMap Tile Map</h2><span class="version">REST CACHE</span></div>
+      <table>
+        <tbody>
+          <tr><th>方案元数据</th><td><a href="{{.Root}}/spm_tile/iserver/services/map-debug/rest/maps/CGCS2000Quad"><code>{{.Root}}/spm_tile/iserver/services/map-debug/rest/maps/{scheme}</code></a></td></tr>
+          <tr><th>切片集</th><td><a href="{{.Root}}/spm_tile/iserver/services/map-debug/rest/maps/CGCS2000Quad/tilesets.json"><code>{{.Root}}/spm_tile/iserver/services/map-debug/rest/maps/{scheme}/tilesets.json</code></a></td></tr>
+          <tr><th>切片图片</th><td><a href="{{.Root}}/spm_tile/iserver/services/map-debug/rest/maps/CGCS2000Quad/tileImage.png?width=256&amp;height=256&amp;scale=0.000001&amp;x=0&amp;y=0&amp;cacheEnabled=true"><code>{{.Root}}/spm_tile/iserver/services/map-debug/rest/maps/{scheme}/tileImage.png?... </code></a></td></tr>
+          <tr><th>许可兼容层</th><td><a href="{{.Root}}/spm_tile/iserver/manager/license.json"><code>{{.Root}}/spm_tile/iserver/manager/license.json</code></a></td></tr>
         </tbody>
       </table>
     </section>

@@ -40,11 +40,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if r.URL.Path == superMapLicensePath {
-		s.writeSuperMapLicense(w, r)
-		return
-	}
-
 	relative, ok := s.relativePath(r.URL.Path)
 	if !ok {
 		w.Header().Set("Cache-Control", noStoreCache)
@@ -63,6 +58,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case relative == "/":
 		s.writeIndex(w, r)
+	case relative == superMapRESTLicensePath || relative == superMapTileLicensePath:
+		s.writeSuperMapLicense(w, r)
 	case relative == "/xyz" || strings.HasPrefix(relative, "/xyz/"):
 		s.handleXYZ(w, r, relative)
 	case relative == "/wmts" || strings.HasPrefix(relative, "/wmts/"):
@@ -74,7 +71,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case relative == "/ags_rest" || strings.HasPrefix(relative, "/ags_rest/"):
 		s.handleAGSRest(w, r, relative)
 	case relative == "/spm_rest" || strings.HasPrefix(relative, "/spm_rest/"):
-		s.handleSuperMapREST(w, r, relative)
+		s.handleSuperMap(w, r, relative, false)
+	case relative == "/spm_tile" || strings.HasPrefix(relative, "/spm_tile/"):
+		s.handleSuperMap(w, r, relative, true)
 	default:
 		http.NotFound(w, r)
 	}

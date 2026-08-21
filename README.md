@@ -37,7 +37,7 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 
 ## 当前支持的服务端点
 
-除特别标注的全局兼容端点外，以下路径均以默认基础路径 `/geo-debug-server` 为前缀：
+以下路径均以默认基础路径 `/geo-debug-server` 为前缀：
 
 | 方法 | 端点 | 功能 |
 | --- | --- | --- |
@@ -63,7 +63,12 @@ docker run --rm ghcr.io/<owner>/geo_debug_server:0.1.0 --version
 | `GET` / `HEAD` | `/ags_rest/{scheme}/export?...&f=json|pjson` | 返回指定方案的 Export Map 结果及图片地址 |
 | `GET` / `HEAD` | `/spm_rest/iserver/services/map-debug/rest/maps/{scheme}` | 根据 SQLite 切片方案返回 SuperMap REST 地图元数据 |
 | `GET` / `HEAD` | `/spm_rest/iserver/services/map-debug/rest/maps/{scheme}/tileImage.png?...` | 根据切片方案和请求参数生成 SuperMap REST 动态调试图片 |
-| `GET` / `HEAD` | `/iserver/manager/license.json` | 返回 SuperMap iServer 许可兼容信息；该全局路径不使用配置的基础路径 |
+| `GET` / `HEAD` | `/spm_rest/iserver/services/map-debug/rest/maps/{scheme}/tilesets.json` | 返回空切片集 `[]`，模拟非切片服务 |
+| `GET` / `HEAD` | `/spm_rest/iserver/manager/license.json` | 返回 SuperMap iServer 许可兼容信息 |
+| `GET` / `HEAD` | `/spm_tile/iserver/services/map-debug/rest/maps/{scheme}` | 返回标记为缓存切片服务的 SuperMap 地图元数据 |
+| `GET` / `HEAD` | `/spm_tile/iserver/services/map-debug/rest/maps/{scheme}/tilesets.json` | 根据 SQLite 方案返回 SuperMap 切片集元数据 |
+| `GET` / `HEAD` | `/spm_tile/iserver/services/map-debug/rest/maps/{scheme}/tileImage.png?...` | 生成 SuperMap 切片服务调试图片 |
+| `GET` / `HEAD` | `/spm_tile/iserver/manager/license.json` | 返回 SuperMap 切片服务许可兼容信息 |
 | `GET` / `HEAD` | `/schemes` | 列出当前全部切片方案及矩阵层级 |
 | `POST` | `/schemes` | 新增切片方案及完整矩阵层级 |
 | `DELETE` | `/schemes/{scheme}` | 移除切片方案；移除默认方案时自动选择剩余方案作为默认 |
@@ -263,10 +268,37 @@ http://localhost:8080/geo-debug-server/spm_rest/iserver/services/map-debug/rest/
 
 单边尺寸限制为 8-4096 像素，总像素不超过 16,777,216。`cacheEnabled=true` 不会改变服务端生成逻辑；成功图片仍遵循本服务统一的 HTTP 长期缓存规则。
 
-iClient 加载时访问的许可检查地址固定为域名根路径，不受 `--base-path` 或 `GEO_DEBUG_BASE_PATH` 影响：
+动态服务没有缓存切片集，`spm_rest` 下每个方案的 `tilesets.json` 与真实 iServer 动态地图服务一致返回空数组：
 
 ```text
-http://localhost:8080/iserver/manager/license.json
+http://localhost:8080/geo-debug-server/spm_rest/iserver/services/map-debug/rest/maps/CGCS2000Quad/tilesets.json
+```
+
+iClient 加载时访问的许可检查地址位于相同的 `spm_rest/iserver` 路径下：
+
+```text
+http://localhost:8080/geo-debug-server/spm_rest/iserver/manager/license.json
+```
+
+## SuperMap Tile Map
+
+缓存切片服务使用相同的 iServer 路径结构，以 `spm_tile` 和动态服务区分。地图元数据中的 `cacheEnabled` 为 `true`：
+
+```text
+http://localhost:8080/geo-debug-server/spm_tile/iserver/services/map-debug/rest/maps/CGCS2000Quad
+```
+
+`tilesets.json` 根据 SQLite 方案生成一项切片集，包含完整的分辨率、96 DPI 比例尺、原点、瓦片尺寸、方案范围、CRS、PNG 格式和 Compact 存储类型。无需额外的方案字段：
+
+```text
+http://localhost:8080/geo-debug-server/spm_tile/iserver/services/map-debug/rest/maps/CGCS2000Quad/tilesets.json
+```
+
+切片图片和许可兼容端点分别为：
+
+```text
+http://localhost:8080/geo-debug-server/spm_tile/iserver/services/map-debug/rest/maps/CGCS2000Quad/tileImage.png?width=256&height=256&scale=0.000001&x=0&y=0&cacheEnabled=true
+http://localhost:8080/geo-debug-server/spm_tile/iserver/manager/license.json
 ```
 
 ## 调试参数

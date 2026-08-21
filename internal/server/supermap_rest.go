@@ -57,16 +57,46 @@ type superMapMetadata struct {
 	Resolutions    []float64           `json:"resolutions"`
 }
 
-func (s *Server) handleSuperMapREST(w http.ResponseWriter, r *http.Request, relative string) {
+type superMapTileset struct {
+	MetaData     superMapTilesetMetadata `json:"metaData"`
+	Name         string                  `json:"name"`
+	TileVersions any                     `json:"tileVersions"`
+}
+
+type superMapTilesetMetadata struct {
+	ScaleDenominators []float64           `json:"scaleDenominators"`
+	OriginalPoint     superMapPoint       `json:"originalPoint"`
+	Resolutions       []float64           `json:"resolutions"`
+	TileWidth         int                 `json:"tileWidth"`
+	MapStatusHashCode string              `json:"mapStatusHashCode"`
+	Transparent       bool                `json:"transparent"`
+	ScaleCaptionsMap  any                 `json:"scaleCaptionsMap"`
+	MapParameter      any                 `json:"mapParameter"`
+	TileType          string              `json:"tileType"`
+	TileFormat        string              `json:"tileFormat"`
+	Bounds            superMapBounds      `json:"bounds"`
+	TileRuleVersion   any                 `json:"tileRuleVersion"`
+	StorageType       string              `json:"storageType"`
+	PrjCoordSys       superMapPrjCoordSys `json:"prjCoordSys"`
+	MapName           string              `json:"mapName"`
+	TilesetName       string              `json:"tilesetName"`
+	TileHeight        int                 `json:"tileHeight"`
+}
+
+func (s *Server) handleSuperMap(w http.ResponseWriter, r *http.Request, relative string, tiled bool) {
 	parts := splitPath(relative)
 	if len(parts) != 7 && len(parts) != 8 {
-		s.writeSuperMapError(w, r, http.StatusNotFound, "expected /spm_rest/iserver/services/map-debug/rest/maps/{scheme} or its /tileImage.png subpath")
+		s.writeSuperMapError(w, r, http.StatusNotFound, "expected a SuperMap maps/{scheme} resource")
 		return
 	}
-	expected := []string{"spm_rest", "iserver", "services", "map-debug", "rest", "maps"}
+	servicePath := "spm_rest"
+	if tiled {
+		servicePath = "spm_tile"
+	}
+	expected := []string{servicePath, "iserver", "services", "map-debug", "rest", "maps"}
 	for index, part := range expected {
 		if !strings.EqualFold(parts[index], part) {
-			s.writeSuperMapError(w, r, http.StatusNotFound, "expected /spm_rest/iserver/services/map-debug/rest/maps/{scheme}")
+			s.writeSuperMapError(w, r, http.StatusNotFound, "unexpected SuperMap service path")
 			return
 		}
 	}
@@ -82,17 +112,28 @@ func (s *Server) handleSuperMapREST(w http.ResponseWriter, r *http.Request, rela
 		return
 	}
 	if len(parts) == 7 {
-		s.writeAGSJSON(w, r, http.StatusOK, newSuperMapMetadata(scheme), true)
+		s.writeAGSJSON(w, r, http.StatusOK, newSuperMapMetadata(scheme, tiled), true)
 		return
 	}
-	if strings.HasSuffix(strings.ToLower(parts[6]), ".json") || !strings.EqualFold(parts[7], "tileImage.png") {
-		s.writeSuperMapError(w, r, http.StatusNotFound, "expected /spm_rest/iserver/services/map-debug/rest/maps/{scheme}/tileImage.png")
+	if strings.HasSuffix(strings.ToLower(parts[6]), ".json") {
+		s.writeSuperMapError(w, r, http.StatusNotFound, "resource subpaths require a scheme name without .json")
 		return
 	}
-	s.writeSuperMapImage(w, r, scheme)
+	switch {
+	case strings.EqualFold(parts[7], "tileImage.png"):
+		s.writeSuperMapImage(w, r, scheme)
+	case strings.EqualFold(parts[7], "tilesets.json"):
+		if tiled {
+			s.writeAGSJSON(w, r, http.StatusOK, newSuperMapTilesets(scheme), true)
+		} else {
+			writeResponse(w, r, http.StatusOK, "application/json; charset=utf-8", []byte("[]"))
+		}
+	default:
+		s.writeSuperMapError(w, r, http.StatusNotFound, "expected a tileImage.png or tilesets.json resource")
+	}
 }
 
-func newSuperMapMetadata(scheme store.Scheme) superMapMetadata {
+func newSuperMapMetadata(scheme store.Scheme, tiled bool) superMapMetadata {
 	bounds := newSuperMapBounds(scheme.MinX, scheme.MinY, scheme.MaxX, scheme.MaxY)
 	resolutions := make([]float64, 0, len(scheme.Levels))
 	for _, level := range scheme.Levels {
@@ -104,11 +145,32 @@ func newSuperMapMetadata(scheme store.Scheme) superMapMetadata {
 		ViewBounds:  bounds, Bounds: bounds,
 		Center:    superMapPoint{X: (scheme.MinX + scheme.MaxX) / 2, Y: (scheme.MinY + scheme.MaxY) / 2},
 		CoordUnit: superMapCoordUnit(scheme), DistanceUnit: "METER", PrjCoordSys: newSuperMapPrjCoordSys(scheme),
-		VisibleScales: []float64{}, DynamicProject: false,
+		VisibleScales: []float64{}, CacheEnabled: tiled, DynamicProject: false,
 		Origin:    superMapPoint{X: scheme.OriginX, Y: scheme.OriginY},
 		TileWidth: scheme.TileWidth, TileHeight: scheme.TileHeight,
 		MinZoom: scheme.MinZoom, MaxZoom: scheme.MaxZoom, Resolutions: resolutions,
 	}
+}
+
+func newSuperMapTilesets(scheme store.Scheme) []superMapTileset {
+	resolutions := make([]float64, 0, len(scheme.Levels))
+	scaleDenominators := make([]float64, 0, len(scheme.Levels))
+	for _, level := range scheme.Levels {
+		resolutions = append(resolutions, level.Resolution)
+		scaleDenominators = append(scaleDenominators, scaleDenominator(level.Resolution, scheme.MetersPerUnit, arcGISTileDPI))
+	}
+	return []superMapTileset{{
+		Name: "debug_tileset_" + scheme.ID,
+		MetaData: superMapTilesetMetadata{
+			ScaleDenominators: scaleDenominators,
+			OriginalPoint:     superMapPoint{X: scheme.OriginX, Y: scheme.OriginY},
+			Resolutions:       resolutions, TileWidth: scheme.TileWidth, TileHeight: scheme.TileHeight,
+			MapStatusHashCode: "DEBUGFIX", Transparent: true,
+			TileType: "Image", TileFormat: "PNG", StorageType: "Compact",
+			Bounds:      newSuperMapBounds(scheme.MinX, scheme.MinY, scheme.MaxX, scheme.MaxY),
+			PrjCoordSys: newSuperMapPrjCoordSys(scheme), MapName: scheme.ID, TilesetName: scheme.ID,
+		},
+	}}
 }
 
 func (s *Server) writeSuperMapImage(w http.ResponseWriter, r *http.Request, scheme store.Scheme) {
